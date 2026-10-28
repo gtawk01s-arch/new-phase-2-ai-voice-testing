@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build and distribution
+dist/
+build/
+
+# Audio and generated cache
+audio_cache/
+*.wav
+*.mp3
+*.ogg
+
+# Secrets - never commit
+.env
+.env.local
+*.pem
+
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs, OS, and temp
+*.log
+.DS_Store
+Thumbs.db
+
+# AI Studio internal artifacts
+.aistudio/
+

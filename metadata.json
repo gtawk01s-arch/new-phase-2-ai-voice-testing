@@ -1,0 +1,7 @@
+{
+  "name": "AI Call Assistant",
+  "description": "Live AI Voice Assistant that transcribes speech, responds conversationally, and generates voice output.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
