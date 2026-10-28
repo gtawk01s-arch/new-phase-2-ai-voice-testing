@@ -190,11 +190,11 @@ export async function synthesizeSpeech(text, options = {}) {
     };
   }
 
-  // 3. Online Gemini TTS synthesis (gemini-3.8-flash-lite-tts is optimized for low-latency IVR / voice assistants)
+  // 3. Online Gemini TTS synthesis (gemini-3.8-flash-tts provides high-fidelity natural speech)
   const geminiKey = CONFIG.GEMINI_API_KEY;
-  const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+  const ttsModels = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 
-  if (geminiKey && (!global.__ttsQuotaExhaustedUntil || Date.now() > global.__ttsQuotaExhaustedUntil)) {
+  if (geminiKey) {
     const geminiVoice = mapToGeminiVoice(voice);
     const ai = new GoogleGenAI({
       apiKey: geminiKey,
@@ -245,9 +245,7 @@ export async function synthesizeSpeech(text, options = {}) {
         }
       } catch (modelErr) {
         console.warn(`[TTS][${callId}] Model ${model} failed (${Date.now() - t0}ms):`, modelErr.message?.slice(0, 100));
-        if (modelErr.message?.includes('429') || modelErr.message?.includes('quota')) {
-          global.__ttsQuotaExhaustedUntil = Date.now() + 60000;
-        }
+        // Continue to try next model in chain
       }
     }
   }

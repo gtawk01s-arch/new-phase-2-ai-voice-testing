@@ -8,6 +8,8 @@ import {
   stopSpeechAudio,
   getAudioContext,
   unlockAudioContext,
+  unlockAudioPlayback,
+  resumeAudioAndSpeech,
   isAudioPlaying
 } from '../utils/audio';
 import { MessageItem } from '../types';
@@ -189,13 +191,17 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
             const isInEchoCooldown = (now - agentFinishedSpeakingTimeRef.current) < 400;
 
             // Acoustic Barge-In interrupt check:
-            // High threshold (65%) so device speakers playing Alex's voice do NOT cut Alex off
-            if (isPlaying && voicePct >= 65 && !isMutedRef.current) {
-              handleBargeIn();
+            // Natural conversational threshold (32%) across 2 frames allows caller to easily interrupt Alex
+            if (isPlaying && voicePct >= 32 && !isMutedRef.current && !isInEchoCooldown) {
+              speechFrameCounterRef.current = (speechFrameCounterRef.current || 0) + 1;
+              if (speechFrameCounterRef.current >= 2) {
+                handleBargeIn();
+              }
             }
 
             // Hands-Free VAD (Voice Activity Detection):
-            // Only listen when call is active, handsfree enabled, not muted, not speaking, not committing, not in echo cooldown
+            // Web SpeechRecognition provides real-time streaming speech-to-text (< 200ms);
+            // MediaRecorder VAD concurrently buffers audio as a fail-safe in case browser speech recognition drops words
             if (
               isInCallRef.current &&
               isHandsfreeRef.current &&
@@ -218,12 +224,12 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
               } else {
                 speechFrameCounterRef.current = 0;
                 if (isVadRecordingRef.current && voicePct < 4) {
-                  // Volume dropped: wait for 380ms silence before endpointing speech
+                  // Volume dropped: wait for 420ms silence before endpointing speech
                   if (!vadSilenceTimeoutRef.current) {
                     vadSilenceTimeoutRef.current = setTimeout(() => {
                       vadSilenceTimeoutRef.current = null;
                       stopMediaRecordingAndSend();
-                    }, 380);
+                    }, 420);
                   }
                 }
               }
@@ -402,9 +408,11 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       return;
     }
 
+    isCommittingTurnRef.current = false;
+
     // Resume listening after delay to avoid acoustic feedback
     setTimeout(() => {
-      if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current) {
+      if (isInCallRef.current && isStandaloneModeRef.current && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
         try {
           speechRecognitionRef.current?.start();
         } catch (e) {}
@@ -429,19 +437,20 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         } catch (e) {}
       }
 
+      const isHindi = selectedVoice?.toLowerCase().includes('hi') || selectedVoice?.toLowerCase().includes('swara') || selectedVoice?.toLowerCase().includes('aarav');
       const recognition = new SpeechRec();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = 'en-US';
+      recognition.lang = isHindi ? 'hi-IN' : 'en-US';
 
       recognition.onstart = () => {
         console.log('🎙️ Browser speech recognition active');
-        setMicStatusMsg('Microphone: Web Speech Recognition Active 🟢');
+        setMicStatusMsg('Microphone: Active & Listening 🟢');
         setMicStatusColor('text-emerald-400');
       };
 
       recognition.onresult = (event: any) => {
-        if (isAgentSpeakingRef.current) return;
+        if (isCommittingTurnRef.current) return;
 
         let interim = '';
         let final = '';
@@ -458,6 +467,15 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         const candidateText = (final || interim).trim();
 
         if (candidateText) {
+          // If agent is speaking, the caller is interrupting Alex (barge-in!)
+          if (isAgentSpeakingRef.current) {
+            console.log('🚨 Barge-in: caller voice recognized while agent speaking');
+            stopSpeechAudio();
+            isAgentSpeakingRef.current = false;
+            setBargeInNotice(true);
+            setTimeout(() => setBargeInNotice(false), 2000);
+          }
+
           currentRecognizedTextRef.current = candidateText;
           setInterimTranscript(candidateText);
           setAgentWaveState('caller-speaking');
@@ -471,16 +489,18 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
             speechSilenceTimeoutRef.current = null;
           }
 
-          // When browser speech recognition yields words, commit promptly!
-          // 120ms on final transcript, 380ms on pause in interim transcript
-          const delayMs = final ? 120 : 380;
+          // When speech recognition yields words, commit after user finishes speaking:
+          // 200ms on final transcript, 520ms on natural pause in interim transcript
+          const delayMs = final ? 200 : 520;
 
           speechSilenceTimeoutRef.current = setTimeout(() => {
             const textToSend = currentRecognizedTextRef.current.trim();
-            if (textToSend && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+            if (textToSend && !isCommittingTurnRef.current) {
               console.log('🚀 Sending voice transcript to AI:', textToSend);
+              isCommittingTurnRef.current = true;
               currentRecognizedTextRef.current = '';
               setInterimTranscript('');
+
               try { recognition.abort(); } catch (e) {}
 
               // Prevent MediaRecorder from uploading redundant audio blob
@@ -503,6 +523,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
 
       recognition.onerror = (event: any) => {
+        if (event.error === 'no-speech') {
+          // Normal silence, ignore
+          return;
+        }
         console.warn('Browser speech recognition event:', event.error);
         if (event.error === 'not-allowed') {
           setErrorMessage('Microphone access was denied. Please allow microphone in browser site settings.');
@@ -513,6 +537,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         // If there was uncommitted speech in the buffer when recognition ended, commit it now!
         const pending = currentRecognizedTextRef.current.trim();
         if (pending && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+          isCommittingTurnRef.current = true;
           currentRecognizedTextRef.current = '';
           setInterimTranscript('');
           if (speechSilenceTimeoutRef.current) {
@@ -524,14 +549,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
           } else {
             commitUserTurn(pending);
           }
-        } else if (isInCallRef.current && !isAgentSpeakingRef.current) {
+        } else if (isInCallRef.current && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
           setTimeout(() => {
-            if (isInCallRef.current && !isAgentSpeakingRef.current) {
-              try {
-                recognition.start();
-              } catch (e) {
-                startBrowserSpeechRecognition();
-              }
+            if (isInCallRef.current && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+              startBrowserSpeechRecognition();
             }
           }, 100);
         }
@@ -719,9 +740,11 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
       agentFinishedSpeakingTimeRef.current = Date.now();
       isAgentSpeakingRef.current = false;
+      isCommittingTurnRef.current = false;
       setAgentWaveState('off');
       setSubtext('Active Live Call • Alex is listening...');
-      setMicStatusMsg('Microphone: Listening for your voice...');
+      setMicStatusMsg('Microphone: Listening for your voice... 🟢');
+      setMicStatusColor('text-emerald-400');
       if (data.action === 'hangup' || data.call_status === 'completed') {
         endVoiceCall('Call completed');
         return;
@@ -729,14 +752,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
       // Resume listening for next caller turn
       setTimeout(() => {
-        if (isInCallRef.current && !isAgentSpeakingRef.current) {
-          try {
-            speechRecognitionRef.current?.start();
-          } catch (e) {
-            startBrowserSpeechRecognition();
-          }
+        if (isInCallRef.current && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+          startBrowserSpeechRecognition();
         }
-      }, 300);
+      }, 250);
     } catch (err: any) {
       console.warn('Audio turn backend unreachable (Netlify static deployment):', err);
       setIsStandaloneMode(true);
@@ -844,8 +863,11 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
       agentFinishedSpeakingTimeRef.current = Date.now();
       isAgentSpeakingRef.current = false;
+      isCommittingTurnRef.current = false;
       setAgentWaveState('off');
       setSubtext('Active Live Call • Alex is listening...');
+      setMicStatusMsg('Microphone: Listening for your voice... 🟢');
+      setMicStatusColor('text-emerald-400');
 
       if (data.action === 'hangup' || data.call_status === 'completed') {
         endVoiceCall('Call completed');
@@ -854,14 +876,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
       // Resume listening for next caller turn
       setTimeout(() => {
-        if (isInCallRef.current && !isAgentSpeakingRef.current) {
-          try {
-            speechRecognitionRef.current?.start();
-          } catch (e) {
-            startBrowserSpeechRecognition();
-          }
+        if (isInCallRef.current && !isAgentSpeakingRef.current && !isCommittingTurnRef.current) {
+          startBrowserSpeechRecognition();
         }
-      }, 300);
+      }, 250);
     } catch (err: any) {
       console.warn('Backend turn error, answering via browser engine:', err);
       setIsStandaloneMode(true);
@@ -902,6 +920,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   // Toggle Voice Call (Start / Hang up)
   const toggleVoiceCall = async () => {
     if (!isInCall) {
+      unlockAudioPlayback();
       await startVoiceCall();
     } else {
       endVoiceCall('Caller hung up');
@@ -909,19 +928,23 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   };
 
   const startVoiceCall = async () => {
-    unlockAudioContext();
+    // 1. Prime audio context and speech synthesis synchronously under the user click gesture
+    unlockAudioPlayback();
+
     try {
       setErrorMessage(null);
-      // Attempt microphone initialization
-      const stream = await initMicrophone(false);
 
-      // Ringing state
+      // 2. Ringing state starts immediately for authentic phone dial experience
       setCallStatus('ringing');
-      setSubtext('Dialing Alex... (Ringing)');
+      setSubtext('Calling Alex... (Ringing)');
       startRingbackTone();
 
       const newCallId = `call-${Date.now()}`;
       setCurrentCallId(newCallId);
+
+      // 3. Concurrently initialize microphone and fetch backend call setup during ring
+      const micPromise = initMicrophone(true).catch(() => null);
+      const ringDelayPromise = new Promise((resolve) => setTimeout(resolve, 600));
 
       let data: any = {
         greeting: "Hello! I'm Alex, your AI voice assistant. What can I help you with today?",
@@ -929,41 +952,44 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
       let isBackendOnline = false;
 
-      try {
-        const res = await fetch('/api/dialer/call/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            call_id: newCallId,
-            direction: 'inbound',
-            voice: selectedVoice
-          })
-        });
-
-        if (res.ok) {
-          const contentType = res.headers.get('content-type') || '';
-          if (contentType.includes('application/json')) {
-            const json = await res.json();
-            if (json && json.greeting) {
-              data = json;
-              isBackendOnline = true;
+      const networkPromise = fetch('/api/dialer/call/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          call_id: newCallId,
+          direction: 'inbound',
+          voice: selectedVoice
+        })
+      })
+        .then(async (res) => {
+          if (res.ok) {
+            const contentType = res.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              const json = await res.json();
+              if (json && json.greeting) {
+                data = json;
+                isBackendOnline = true;
+              }
             }
           }
-        }
-      } catch (backendErr) {
-        console.info('Backend unavailable. Operating in Browser Voice Mode (Netlify/static host):', backendErr);
-      }
+        })
+        .catch((backendErr) => {
+          console.info('Backend unavailable. Operating in Browser Voice Mode:', backendErr);
+        });
+
+      // Wait for ring delay, network setup, and mic stream in parallel
+      const [stream] = await Promise.all([micPromise, networkPromise, ringDelayPromise]);
 
       setIsStandaloneMode(!isBackendOnline);
       stopRingbackTone();
       playCallChime(true);
 
-      // Connected!
+      // 4. Connected!
       setIsInCall(true);
       setCallStatus('in-call');
       setSubtext(
         !isBackendOnline
-          ? 'Active Call • Browser Voice Engine (Netlify Static Host)'
+          ? 'Active Call • Browser Voice Engine'
           : stream
           ? 'Active Live Phone Call • High Fidelity Audio'
           : 'Active Live Call • Speak or type below (Alex speaks back aloud)'
@@ -998,18 +1024,26 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
       setMessages((prev) => [...prev, greetingMsg]);
 
-      // Play greeting aloud
+      // 5. Start browser speech recognition IMMEDIATELY for seamless hands-free telephone dialogue
+      startBrowserSpeechRecognition();
+
+      // 6. Play greeting aloud automatically (Chrome-unlocked)
       isAgentSpeakingRef.current = true;
       setAgentWaveState('agent-speaking');
+      setSubtext(`Alex: "${greetingText}"`);
+      setMicStatusMsg('🔊 Alex is speaking...');
+      setMicStatusColor('text-sky-400');
 
-      await playVoiceAudio(greetingText, data.audio_url, selectedVoice, isSpeakerOnRef.current);
-
-      agentFinishedSpeakingTimeRef.current = Date.now();
-      isAgentSpeakingRef.current = false;
-      setAgentWaveState('off');
-
-      // Start browser speech recognition for real-time streaming speech-to-text
-      startBrowserSpeechRecognition();
+      playVoiceAudio(greetingText, data.audio_url, selectedVoice, isSpeakerOnRef.current).then(() => {
+        if (!isCommittingTurnRef.current) {
+          agentFinishedSpeakingTimeRef.current = Date.now();
+          isAgentSpeakingRef.current = false;
+          setAgentWaveState('off');
+          setSubtext('Active Live Call • Alex is listening...');
+          setMicStatusMsg('Microphone: Listening for your voice... 🟢');
+          setMicStatusColor('text-emerald-400');
+        }
+      });
     } catch (err: any) {
       console.error('Call connection error:', err);
       stopRingbackTone();
@@ -1315,6 +1349,20 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
                 className="text-[11px] bg-blue-600 hover:bg-blue-500 text-white font-bold px-2 py-0.5 rounded cursor-pointer transition-all"
               >
                 Enable Mic
+              </button>
+            )}
+            {isInCall && (
+              <button
+                type="button"
+                onClick={() => {
+                  unlockAudioPlayback();
+                  resumeAudioAndSpeech();
+                }}
+                className="text-[11px] bg-slate-700 hover:bg-slate-600 text-slate-200 px-2 py-0.5 rounded cursor-pointer transition-all flex items-center gap-1 border border-white/10"
+                title="Tap to verify audio is unmuted in Chrome"
+              >
+                <span>🔊</span>
+                <span>Unmute Audio</span>
               </button>
             )}
             {bargeInNotice && (

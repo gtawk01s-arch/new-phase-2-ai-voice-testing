@@ -64,19 +64,18 @@ async function callGemini(messages, systemInstruction, timeoutMs, callId) {
     providerCounters.gemini.requests++;
     const t0 = Date.now();
     try {
+      const modelConfig = {
+        systemInstruction,
+        temperature: 0.7
+      };
+
       const response = await Promise.race([
         ai.models.generateContent({
           model,
           contents,
-          config: {
-            systemInstruction,
-            temperature: 0.7,
-            thinkingConfig: {
-              thinkingLevel: 'MINIMAL'
-            }
-          }
+          config: modelConfig
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout (${timeoutMs}ms)`)), Math.min(timeoutMs, 4500)))
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout (${timeoutMs}ms)`)), Math.min(timeoutMs, 2200)))
       ]);
 
       const text = (response.text || '').trim();

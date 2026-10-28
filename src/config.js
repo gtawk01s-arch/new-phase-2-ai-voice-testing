@@ -96,8 +96,8 @@ export const CONFIG = {
 
   // Fallback Models Chain
   GEMINI_MODELS: [
-    'gemini-3.1-flash-lite',
     'gemini-3.8-flash',
+    'gemini-3.1-flash-lite',
     'gemini-flash-latest'
   ],
   GROQ_MODELS: [
@@ -126,10 +126,10 @@ export const CONFIG = {
 
   // Timeouts (ms)
   TIMEOUTS: {
-    LLM_PER_PROVIDER: 9000,
-    ASR_GEMINI: 9000,
-    TTS_EDGE: 1500,
-    TOTAL_BUDGET: 1500
+    LLM_PER_PROVIDER: 3000,
+    ASR_GEMINI: 3000,
+    TTS_EDGE: 3000,
+    TOTAL_BUDGET: 3000
   },
 
   // Audio configuration

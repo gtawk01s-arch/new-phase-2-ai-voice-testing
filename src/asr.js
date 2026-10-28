@@ -101,10 +101,10 @@ export async function transcribeAudio(audioBuffer, options = {}) {
     }
   }
 
-  // 2. Primary Multimodal ASR: Gemini (gemini-3.5-transcribe with gemini-3.1-flash-lite fallback)
+  // 2. Primary Multimodal ASR: Gemini 3.8 Flash
   const geminiKey = process.env.GEMINI_API_KEY || CONFIG.GEMINI_API_KEY;
   if (geminiKey) {
-    const geminiAsrModels = ['gemini-3.5-transcribe', 'gemini-3.1-flash-lite'];
+    const geminiAsrModels = ['gemini-3.8-flash'];
     const base64Audio = audioBuffer.toString('base64');
     const audioPart = {
       inlineData: {
@@ -123,24 +123,23 @@ export async function transcribeAudio(audioBuffer, options = {}) {
             }
           }
         });
-        const isTranscribeModel = model.includes('transcribe');
         const geminiPromise = ai.models.generateContent({
           model,
-          contents: {
-            parts: [
-              audioPart,
-              { text: `Transcribe the audio speech accurately in ${asrLang}. Output ONLY the transcribed words. If there is no human speech, output NO_SPEECH.` }
-            ]
-          },
-          config: isTranscribeModel ? undefined : {
-            temperature: 0.0,
-            thinkingConfig: {
-              thinkingLevel: 'LOW'
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                audioPart,
+                { text: `Transcribe the audio speech accurately in ${asrLang}. Output ONLY the transcribed words. If there is no human speech, output NO_SPEECH.` }
+              ]
             }
+          ],
+          config: {
+            temperature: 0.0
           }
         });
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Gemini ASR (${model}) timeout`)), 7000)
+          setTimeout(() => reject(new Error(`Gemini ASR (${model}) timeout`)), 3500)
         );
         const response = await Promise.race([geminiPromise, timeoutPromise]);
 
