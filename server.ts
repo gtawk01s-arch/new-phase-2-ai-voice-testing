@@ -7,9 +7,9 @@ import multer from 'multer';
 import os from 'os';
 import { createServer as createViteServer } from 'vite';
 
-import { CONFIG, CHAOS_STATE, getCampaign, getLanguage } from './src/config.js';
+import { CONFIG, CHAOS_STATE, isChaosAllowed, getCampaign } from './src/config.js';
 import webhookRouter from './src/webhook.js';
-import { pregenerateStaticLines, synthesizeSpeech } from './src/tts.js';
+import { pregenerateStaticLines, synthesizeSpeech, waitForAudioFile, getTtsCounters, cleanExpiredAudioCache } from './src/tts.js';
 import {
   getGlobalLatencyMetrics,
   getAllSessions,
@@ -19,11 +19,16 @@ import {
   getAuditCalls,
   flagTurn,
   correctTranscript,
-  exportFineTuningDataset
+  exportFineTuningDataset,
+  scrubIndianPii,
+  getStageLatencyBugs,
+  triggerWeeklyRetrainingJob,
+  getRetrainingRuns
 } from './src/session.js';
-import { getProviderCounters } from './src/llm.js';
-import { transcribeAudio } from './src/asr.js';
+import { getProviderCounters, resetProviderCooldowns } from './src/llm.js';
+import { transcribeAudio, getAsrCounters } from './src/asr.js';
 import { processTurn } from './src/engine.js';
+import { createAudioSocketServer } from './src/asterisk_audiosocket.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,55 +64,78 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// 1. Healthcheck endpoint checking ASR, TTS, and LLM (Phase 2 Task 8)
-const getHealthPayload = async (deepCheck = false) => {
+// 1. Healthcheck endpoint checking ASR, TTS, LLM, and Session Store
+const getHealthPayload = async () => {
   const latency = getGlobalLatencyMetrics();
-  const providers = getProviderCounters();
+  const llmMetrics = getProviderCounters();
+  const asrMetrics = getAsrCounters();
+  const ttsMetrics = getTtsCounters();
+  const chaosActive = isChaosAllowed();
 
   const asrStatus = {
-    status: CHAOS_STATE.simulateAsrFail ? 'simulated_failure' : (CONFIG.GROQ_API_KEY ? 'ready' : 'unconfigured'),
-    primary: 'groq/whisper-large-v3-turbo',
-    secondary: 'groq/whisper-large-v3',
-    fallback: 'gemini/gemini-3.8-flash'
+    status: (chaosActive && CHAOS_STATE.simulateAsrFail)
+      ? 'simulated_failure'
+      : ((CONFIG.GROQ_API_KEY || CONFIG.GEMINI_API_KEY) ? 'ready' : 'unconfigured'),
+    vad_and_8k_resampler: 'active',
+    providers: ['groq/whisper-large-v3-turbo', 'gemini/gemini-3-flash-preview', 'gemini/gemini-3.5-transcribe'],
+    metrics: asrMetrics
   };
 
   const llmStatus = {
-    status: (CHAOS_STATE.simulateLlmFail || CHAOS_STATE.forceProvider === 'all_down')
+    status: (chaosActive && (CHAOS_STATE.simulateLlmFail || CHAOS_STATE.forceProvider === 'all_down'))
       ? 'simulated_outage'
-      : (CONFIG.GROQ_API_KEY || CONFIG.GEMINI_API_KEY ? 'ready' : 'degraded'),
-    groq_active: Boolean(CONFIG.GROQ_API_KEY && CONFIG.GROQ_API_KEY.startsWith('gsk_')),
-    gemini_active: Boolean(CONFIG.GEMINI_API_KEY),
-    active_models: CONFIG.GROQ_MODELS,
-    metrics: providers
+      : ((CONFIG.GEMINI_API_KEY || CONFIG.GROQ_API_KEY || CONFIG.OPENROUTER_API_KEY) ? 'ready' : 'degraded'),
+    gemini_configured: Boolean(CONFIG.GEMINI_API_KEY),
+    groq_configured: Boolean(CONFIG.GROQ_API_KEY),
+    openrouter_configured: Boolean(CONFIG.OPENROUTER_API_KEY),
+    cooldown_seconds: CONFIG.PROVIDER_COOLDOWN_MS / 1000,
+    metrics: llmMetrics
   };
 
-  const ttsCacheReady = fs.existsSync(CONFIG.AUDIO.CACHE_DIR);
+  const fallbackFiles = fs.existsSync(CONFIG.AUDIO.FALLBACK_DIR)
+    ? fs.readdirSync(CONFIG.AUDIO.FALLBACK_DIR).filter(f => f.endsWith('.wav'))
+    : [];
   const ttsStatus = {
-    status: CHAOS_STATE.simulateTtsFail ? 'simulated_failure' : (ttsCacheReady ? 'ready' : 'error'),
+    status: (chaosActive && CHAOS_STATE.simulateTtsFail)
+      ? 'simulated_failure'
+      : (fallbackFiles.length > 0 ? 'ready' : 'degraded'),
     cache_dir: CONFIG.AUDIO.CACHE_DIR,
-    fallback_cached: true,
-    engine: 'gemini-3.8-flash-tts / client-synthesis'
+    prerecorded_fallback_files: fallbackFiles,
+    providers: [
+      CONFIG.GOOGLE_CLOUD_TTS_KEY ? 'google-cloud-tts (active)' : 'google-cloud-tts (unconfigured)',
+      CONFIG.BHASHINI_API_KEY ? 'bhashini-tts (active)' : 'bhashini-tts (unconfigured)',
+      CONFIG.GEMINI_API_KEY ? 'gemini-3.8-flash-lite-tts (active)' : 'gemini-3.8-flash-lite-tts (unconfigured)'
+    ],
+    metrics: ttsMetrics
   };
+
+  const activeSessionsCount = getAllSessions().filter((s: any) => s.status === 'active' || s.status === 'connected').length;
 
   return {
     status: (asrStatus.status === 'ready' && llmStatus.status === 'ready' && ttsStatus.status === 'ready') ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     port: CONFIG.PORT,
-    version: '2.0.0',
-    mode: 'tested with recordings', // per requirement: reports say tested with recordings, never live
+    audiosocket_port: CONFIG.AUDIOSOCKET_PORT,
+    version: '2.1.0',
+    webhook_auth_enforced: CONFIG.SECURITY.ENFORCE_AUTH,
     subsystems: {
       asr: asrStatus,
       llm: llmStatus,
-      tts: ttsStatus
+      tts: ttsStatus,
+      sessions: {
+        active: activeSessionsCount,
+        capacity: CONFIG.SESSION_TTL.MAX_CAPACITY
+      }
     },
-    chaos_mode: CHAOS_STATE,
+    chaos_enabled: chaosActive,
+    chaos_mode: chaosActive ? CHAOS_STATE : undefined,
     latency: {
       target_ms: CONFIG.TIMEOUTS.TOTAL_BUDGET,
       p50_ms: latency.p50,
       p95_ms: latency.p95,
       samples: latency.sample_count
     },
-    active_sessions: getAllSessions().filter((s: any) => s.status === 'connected').length
+    active_sessions: activeSessionsCount
   };
 };
 
@@ -121,20 +149,37 @@ app.get('/api/health', async (_req: Request, res: Response) => {
   res.json(payload);
 });
 
-// 2. Admin Chaos Injection Routes (Kill providers on purpose to test fallbacks)
+// 2. Admin Chaos Injection Routes (gated behind isChaosAllowed())
 app.get('/api/admin/chaos', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', chaos: CHAOS_STATE });
+  res.json({
+    status: 'ok',
+    chaos_allowed: isChaosAllowed(),
+    chaos: CHAOS_STATE
+  });
 });
 
 app.post('/api/admin/chaos', (req: Request, res: Response) => {
+  if (!isChaosAllowed()) {
+    return res.status(403).json({
+      error: 'Chaos injection is disabled in production. Set ALLOW_CHAOS_TESTING=true to enable.'
+    });
+  }
   if (typeof req.body.simulateAsrFail === 'boolean') CHAOS_STATE.simulateAsrFail = req.body.simulateAsrFail;
   if (typeof req.body.simulateLlmFail === 'boolean') CHAOS_STATE.simulateLlmFail = req.body.simulateLlmFail;
   if (typeof req.body.simulateTtsFail === 'boolean') CHAOS_STATE.simulateTtsFail = req.body.simulateTtsFail;
-  if (['none', 'groq', 'gemini', 'all_down'].includes(req.body.forceProvider)) {
+  if (['none', 'groq', 'gemini', 'openrouter', 'all_down'].includes(req.body.forceProvider)) {
     CHAOS_STATE.forceProvider = req.body.forceProvider;
   }
-  console.log('⚡ Chaos state updated:', CHAOS_STATE);
+  if (!CHAOS_STATE.simulateLlmFail && CHAOS_STATE.forceProvider === 'none') {
+    resetProviderCooldowns();
+  }
+  console.log('[Chaos] Updated state:', CHAOS_STATE);
   res.json({ status: 'updated', chaos: CHAOS_STATE });
+});
+
+app.post('/api/admin/cache/sweep', (_req: Request, res: Response) => {
+  const evicted = cleanExpiredAudioCache();
+  res.json({ status: 'ok', evicted_files: evicted });
 });
 
 // 3. QA Analyst Routes (Inspect, Flag, Correct, Fine-Tune Export)
@@ -173,10 +218,212 @@ app.get('/api/qa/export-finetuning', (_req: Request, res: Response) => {
   res.send(jsonl);
 });
 
+// 3B. Sovereign GPU Architecture, MLOps & Governance Routes (15-Point Plan)
+app.get('/api/sovereign/overview', (_req: Request, res: Response) => {
+  const sunsetDate = new Date(CONFIG.SOVEREIGN_GPU.EXTERNAL_API_SUNSET_DATE + 'T23:59:59Z');
+  const daysRemaining = Math.max(0, Math.ceil((sunsetDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
+  res.json({
+    status: 'ok',
+    sovereign_gpu: {
+      ...CONFIG.SOVEREIGN_GPU,
+      disable_external_apis: CONFIG.SOVEREIGN_GPU.DISABLE_EXTERNAL_APIS,
+      days_until_external_api_sunset: daysRemaining
+    },
+    stage_budgets_ms: CONFIG.STAGE_BUDGETS_MS,
+    stage_latency_bugs: getStageLatencyBugs(),
+    license_ledger: CONFIG.LICENSE_LEDGER,
+    voice_catalog: CONFIG.VOICE_CATALOG,
+    tenant_clients: Object.values(CONFIG.TENANT_CLIENTS),
+    data_governance: CONFIG.DATA_GOVERNANCE,
+    rollout_gates: CONFIG.ROLLOUT_GATES,
+    cost_comparison: CONFIG.COST_COMPARISON,
+    retraining_runs: getRetrainingRuns()
+  });
+});
+
+app.post('/api/sovereign/toggle-external-apis', (req: Request, res: Response) => {
+  const disable = Boolean(req.body.disable_external_apis);
+  process.env.DISABLE_EXTERNAL_APIS = disable ? 'true' : 'false';
+  res.json({
+    status: 'updated',
+    disable_external_apis: CONFIG.SOVEREIGN_GPU.DISABLE_EXTERNAL_APIS,
+    mode: disable
+      ? 'SOVEREIGN_GPU_ONLY (7B vLLM -> 3B In-House Backup -> Pre-Recorded WAV -> Human Transfer)'
+      : 'HYBRID_BRIDGE_UNTIL_2026_12_31'
+  });
+});
+
+app.post('/api/sovereign/scrub-pii', (req: Request, res: Response) => {
+  const rawText = req.body.text || '';
+  const result = scrubIndianPii(rawText);
+  res.json({
+    status: 'ok',
+    original: rawText,
+    ...result
+  });
+});
+
+app.post('/api/sovereign/retrain', (req: Request, res: Response) => {
+  const language = req.body.language || 'hi';
+  const run = triggerWeeklyRetrainingJob(language);
+  res.json({
+    status: 'completed',
+    run,
+    all_runs: getRetrainingRuns()
+  });
+});
+
+// Helper for word-level Levenshtein distance (real WER calculation)
+function computeWordErrorStats(refText: string, hypText: string) {
+  const normalize = (s: string) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[.,?!;:"'()[\]{}|।॥\-–—]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
+  const r = normalize(refText);
+  const h = normalize(hypText);
+  if (r.length === 0) return { distance: h.length, refWords: 0 };
+  const dp: number[][] = Array.from({ length: r.length + 1 }, () => new Array(h.length + 1).fill(0));
+  for (let i = 0; i <= r.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= h.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= r.length; i++) {
+    for (let j = 1; j <= h.length; j++) {
+      if (r[i - 1] === h[j - 1]) dp[i][j] = dp[i - 1][j - 1];
+      else dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return { distance: dp[r.length][h.length], refWords: r.length };
+}
+
+app.post('/api/qa/run-audio-suite', async (_req: Request, res: Response) => {
+  try {
+    const manifestPath = path.join(CONFIG.AUDIO.RECORDINGS_DIR, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      return res.status(404).json({ error: '8kHz recordings manifest not found in /tests/recordings/manifest.json' });
+    }
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const recordings = manifest.recordings || [];
+    const items: any[] = [];
+    const vadLatencies: number[] = [];
+    const asrLatencies: number[] = [];
+    const llmLatencies: number[] = [];
+    const ttsLatencies: number[] = [];
+    const totalLatencies: number[] = [];
+
+    let enErrors = 0;
+    let enRefWords = 0;
+    let hiErrors = 0;
+    let hiRefWords = 0;
+    let passedCount = 0;
+
+    for (let i = 0; i < recordings.length; i++) {
+      const rec = recordings[i];
+      const wavPath = path.join(CONFIG.AUDIO.RECORDINGS_DIR, rec.filename);
+      if (!fs.existsSync(wavPath)) continue;
+
+      const callId = `qa-8k-${rec.id}-${Date.now()}`;
+      const session = getOrCreateSession(callId, {
+        direction: 'inbound',
+        callerId: rec.lang === 'hi' ? '+919876543210' : '+919811122233',
+        campaignId: rec.campaign || (rec.lang === 'hi' ? 'support_hi' : 'support'),
+        language: rec.lang
+      });
+
+      const audioBuffer = fs.readFileSync(wavPath);
+      const asr = await transcribeAudio(audioBuffer, {
+        callId,
+        language: rec.lang,
+        mimeType: 'audio/wav'
+      });
+
+      const tTurn = Date.now();
+      const engineResult = await processTurn(session, asr.text || '');
+      const ttsResult = await synthesizeSpeech(engineResult.reply, {
+        language: rec.lang,
+        callId
+      });
+
+      const vadMs = asr.vad_ms || 0;
+      const asrMs = asr.latency_ms || 0;
+      const llmMs = engineResult.timing_ms?.llm || 0;
+      const ttsMs = ttsResult.latency_ms || 0;
+      const totalMs = asrMs + (Date.now() - tTurn);
+
+      vadLatencies.push(vadMs);
+      asrLatencies.push(asrMs);
+      llmLatencies.push(llmMs);
+      ttsLatencies.push(ttsMs);
+      totalLatencies.push(totalMs);
+
+      session.recordLatency({ vad: vadMs, asr: asrMs, llm: llmMs, tts: ttsMs, total: totalMs });
+
+      const wer = computeWordErrorStats(rec.referenceText, asr.text || '');
+      if (rec.lang === 'hi') {
+        hiErrors += wer.distance;
+        hiRefWords += wer.refWords;
+      } else {
+        enErrors += wer.distance;
+        enRefWords += wer.refWords;
+      }
+
+      let passed = Boolean(asr.text && engineResult.reply);
+      if (rec.expectAction === 'transfer') {
+        passed = engineResult.action === 'transfer' && (!rec.expectExt || engineResult.transfer?.id === rec.expectExt);
+      } else if (rec.expectAction === 'hangup') {
+        passed = engineResult.action === 'hangup';
+      }
+      if (passed) passedCount++;
+
+      items.push({
+        id: i + 1,
+        category: `${rec.lang.toUpperCase()} 8kHz WAV (${rec.filename})`,
+        referenceText: rec.referenceText,
+        input: asr.text || '(empty transcript)',
+        passed,
+        reply: engineResult.reply || '(empty)',
+        latency: totalMs,
+        timings: { vad: vadMs, asr: asrMs, llm: llmMs, tts: ttsMs, total: totalMs },
+        werPct: wer.refWords > 0 ? `${((wer.distance / wer.refWords) * 100).toFixed(1)}%` : '0.0%'
+      });
+    }
+
+    const p50 = (arr: number[]) => {
+      if (!arr.length) return 0;
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.floor(s.length * 0.5)];
+    };
+    const p95 = (arr: number[]) => {
+      if (!arr.length) return 0;
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+    };
+
+    res.json({
+      total: items.length,
+      passed: passedCount,
+      failed: items.length - passedCount,
+      p50Latency: p50(totalLatencies),
+      p95Latency: p95(totalLatencies),
+      legMedians: {
+        vad: p50(vadLatencies),
+        asr: p50(asrLatencies),
+        llm: p50(llmLatencies),
+        tts: p50(ttsLatencies)
+      },
+      werEnglish: enRefWords > 0 ? `${((enErrors / enRefWords) * 100).toFixed(1)}% (${enErrors}/${enRefWords} words)` : 'N/A',
+      werHindi: hiRefWords > 0 ? `${((hiErrors / hiRefWords) * 100).toFixed(1)}% (${hiErrors}/${hiRefWords} words)` : 'N/A',
+      items
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to run 8kHz audio suite' });
+  }
+});
+
 // 4. Telephony Webhook Contract Router
 app.use('/api/webhook', webhookRouter);
 
-// 5. PBX / Dialer Routes
+// 5. PBX / Dialer Simulator Routes
 app.get('/api/dialer/languages', (_req: Request, res: Response) => {
   res.json({
     status: 'success',
@@ -213,10 +460,21 @@ app.post('/api/dialer/call/start', async (req: Request, res: Response) => {
   const direction = req.body.direction === 'outbound' ? 'outbound' : 'inbound';
   const callerId = req.body.caller_id || req.body.From || 'Anonymous';
   const customerName = req.body.customer_name || '';
-  const campaignId = req.body.campaign || (direction === 'outbound' ? 'sales' : 'support');
+  const reqLang = req.body.language || (req.body.voice?.toLowerCase().includes('hi') ? 'hi' : '');
+  const defaultCamp = reqLang === 'hi'
+    ? 'support_hi'
+    : reqLang === 'hi-Latn'
+    ? 'support_hinglish'
+    : direction === 'outbound'
+    ? 'sales'
+    : 'support';
+  const campaignId = req.body.campaign || defaultCamp;
   const campaign = getCampaign(campaignId);
-  const language = req.body.language || campaign.language || 'en';
-  const chosenVoice = req.body.voice || campaign.voice || CONFIG.AUDIO.DEFAULT_VOICE;
+  const language = reqLang || campaign.language || 'en';
+  const chosenVoice =
+    language.startsWith('hi') && (!req.body.voice || req.body.voice.startsWith('en-'))
+      ? campaign.voice || 'hi-IN-SwaraNeural'
+      : req.body.voice || campaign.voice || CONFIG.AUDIO.DEFAULT_VOICE;
 
   const session = getOrCreateSession(callId, {
     direction,
@@ -225,16 +483,22 @@ app.post('/api/dialer/call/start', async (req: Request, res: Response) => {
     language,
     customerName
   });
+  session.language = language;
+  session.campaignId = campaignId;
 
   const greeting = req.body.custom_greeting || campaign.greeting;
-  session.recordTurn('assistant', greeting, { intent: 'greeting', action: 'speak_and_listen' });
+  const greetingTurn = session.recordTurn('assistant', greeting, { intent: 'greeting', action: 'speak_and_listen' });
 
   console.log(`[Dialer][${callId}] Synthesizing greeting: "${greeting}" (${language}) with voice: ${chosenVoice}`);
   const ttsRes = await synthesizeSpeech(greeting, {
-    isStatic: !req.body.custom_greeting,
+    language,
+    nonBlocking: false,
     voice: chosenVoice,
     callId
   });
+  if (greetingTurn && ttsRes.audio_url) {
+    greetingTurn.audioUrl = ttsRes.audio_url;
+  }
 
   res.json({
     status: 'success',
@@ -243,6 +507,7 @@ app.post('/api/dialer/call/start', async (req: Request, res: Response) => {
     call_status: 'connected',
     greeting,
     audio_url: ttsRes.audio_url,
+    tts_latency_ms: ttsRes.latency_ms,
     language,
     available_extensions: CONFIG.EXTENSIONS,
     session: {
@@ -261,28 +526,72 @@ app.post('/api/dialer/call/interact', upload.single('audio'), async (req: Reques
   const tempPath = req.file?.path;
   let userText = (req.body.text || '').trim();
   let asrLatency = 0;
+  let vadLatency = 0;
+
+  if (req.body.language) {
+    session.language = req.body.language;
+    if (req.body.language === 'hi' && (!session.campaignId || session.campaignId === 'support' || session.campaignId === 'support_hinglish')) {
+      session.campaignId = 'support_hi';
+    } else if (req.body.language === 'hi-Latn' && (!session.campaignId || session.campaignId === 'support' || session.campaignId === 'support_hi')) {
+      session.campaignId = 'support_hinglish';
+    } else if (req.body.language === 'en' && (session.campaignId === 'support_hi' || session.campaignId === 'support_hinglish')) {
+      session.campaignId = 'support';
+    }
+  }
 
   try {
     if (tempPath && !userText) {
       const audioBuffer = fs.readFileSync(tempPath);
-      const asr = await transcribeAudio(audioBuffer, { callId, language: session.language });
-      userText = asr.text;
+      const asr = await transcribeAudio(audioBuffer, {
+        callId,
+        language: session.language,
+        mimeType: req.file?.mimetype
+      });
+      userText = (asr.text || '').trim();
       asrLatency = asr.latency_ms;
+      vadLatency = asr.vad_ms || 0;
+
+      if (!userText && !(isChaosAllowed() && CHAOS_STATE.simulateAsrFail)) {
+        return res.json({
+          call_id: callId,
+          action: 'continue',
+          call_status: session.status,
+          transcription: '',
+          response: '',
+          no_speech: true,
+          audio_url: null,
+          language: session.language,
+          timings: { vad: vadLatency, asr: asrLatency, llm: 0, tts: 0, total: asrLatency }
+        });
+      }
     }
 
     const t0 = Date.now();
     const engineResult = await processTurn(session, userText);
     const campaign = getCampaign(session.campaignId);
-    const chosenVoice = req.body.voice || campaign.voice || CONFIG.AUDIO.DEFAULT_VOICE;
+    const chosenVoice =
+      session.language?.startsWith('hi') && (!req.body.voice || req.body.voice.startsWith('en-'))
+        ? campaign.voice || 'hi-IN-SwaraNeural'
+        : req.body.voice || campaign.voice || CONFIG.AUDIO.DEFAULT_VOICE;
 
     const tts0 = Date.now();
     const ttsResult = await synthesizeSpeech(engineResult.reply, {
+      language: session.language,
       voice: chosenVoice,
+      nonBlocking: false,
       callId
     });
-    const ttsLatency = Date.now() - tts0;
+    const ttsLatency = ttsResult.latency_ms ?? (Date.now() - tts0);
+
+    if (session.history.length > 0 && ttsResult.audio_url) {
+      const lastTurn = session.history[session.history.length - 1];
+      if (lastTurn && lastTurn.role === 'assistant') {
+        lastTurn.audioUrl = ttsResult.audio_url;
+      }
+    }
 
     const timings = {
+      vad: vadLatency,
       asr: asrLatency,
       llm: engineResult.timing_ms?.llm || 0,
       tts: ttsLatency,
@@ -297,6 +606,7 @@ app.post('/api/dialer/call/interact', upload.single('audio'), async (req: Reques
       transcription: userText,
       response: engineResult.reply,
       audio_url: ttsResult.audio_url,
+      fallback_audio_used: Boolean(ttsResult.fallback_used),
       disposition: engineResult.disposition,
       language: session.language,
       transfer: engineResult.transfer ? {
@@ -320,7 +630,7 @@ app.post('/api/dialer/call/interact', upload.single('audio'), async (req: Reques
     res.status(500).json({ error: err.message || 'Failed to interact' });
   } finally {
     if (tempPath && fs.existsSync(tempPath)) {
-      try { fs.unlinkSync(tempPath); } catch (e) {}
+      try { fs.unlinkSync(tempPath); } catch (_) {}
     }
   }
 });
@@ -335,16 +645,21 @@ app.post('/api/dialer/call/transfer', async (req: Request, res: Response) => {
   session.disposition = 'manual_transfer';
   (session as any).transferredTo = ext;
 
-  const transferMessage = session.language.startsWith('hi')
+  const transferMessage = session.language === 'hi'
     ? `अवश्य! मैं आपकी कॉल सीधे ${ext.name} को एक्सटेंशन ${ext.id} पर ट्रांसफर कर रहा हूँ। कृपया लाइन पर बने रहें।`
-    : `Certainly! I am transferring your call directly to ${ext.name} on extension ${ext.id}. Please stay on the line.`;
+    : (session.language === 'hi-Latn'
+      ? `Sure! Main aapki call ${ext.name} ko extension ${ext.id} par transfer kar raha hoon. Please hold kijiye.`
+      : `Certainly! I am transferring your call directly to ${ext.name} on extension ${ext.id}. Please stay on the line.`);
 
-  session.recordTurn('assistant', transferMessage, { action: 'transfer', intent: 'manual_transfer' });
+  const transferTurn = session.recordTurn('assistant', transferMessage, { action: 'transfer', intent: 'manual_transfer' });
 
   const ttsRes = await synthesizeSpeech(transferMessage, {
-    isStatic: true,
+    language: session.language,
     callId
   });
+  if (transferTurn && ttsRes.audio_url) {
+    transferTurn.audioUrl = ttsRes.audio_url;
+  }
 
   res.json({
     status: 'transferred',
@@ -376,31 +691,31 @@ app.post('/api/reset/:id', (req: Request, res: Response) => {
   res.json({ status: 'reset', call_id: callId });
 });
 
-// Dedicated TTS synthesis endpoint (Phase 2 Task 8: cached fallback line verification)
+// Dedicated TTS synthesis endpoint
 app.post('/api/tts', async (req: Request, res: Response) => {
-  const { text, voice, callId } = req.body;
+  const { text, voice, language, callId } = req.body;
   if (!text) {
     return res.status(400).json({ error: 'text is required' });
   }
-  const result = await synthesizeSpeech(text, { voice, callId });
-  if (result.fallback_used || result.is_fallback) {
+  const result = await synthesizeSpeech(text, { voice, language, callId });
+  if (result.fallback_used) {
     res.setHeader('X-Fallback-Cached', 'true');
   }
-  const audioFilename = result.filename || (result.audio_url ? path.basename(result.audio_url) : 'fallback-general.wav');
+  const audioFilename = result.filename || (result.audio_url ? path.basename(result.audio_url) : 'fallback-transfer-en.wav');
   const safeFilename = path.basename(audioFilename);
-  const filePath = path.join(CONFIG.AUDIO.CACHE_DIR, safeFilename);
+  const resolvedPath = await waitForAudioFile(safeFilename, 2400);
 
   if (req.headers.accept?.includes('application/json')) {
     return res.json(result);
   }
-  if (fs.existsSync(filePath)) {
+  if (resolvedPath && fs.existsSync(resolvedPath)) {
     res.setHeader('Content-Type', 'audio/wav');
-    return res.sendFile(filePath);
+    return res.sendFile(resolvedPath);
   }
   return res.json(result);
 });
 
-// Dedicated ASR transcription endpoint
+// Dedicated ASR transcription endpoint (with VAD & 8kHz->16kHz upsampling)
 app.post('/api/asr', upload.single('audio'), async (req: Request, res: Response) => {
   const tempPath = req.file?.path;
   if (!tempPath) {
@@ -410,7 +725,8 @@ app.post('/api/asr', upload.single('audio'), async (req: Request, res: Response)
     const audioBuffer = fs.readFileSync(tempPath);
     const result = await transcribeAudio(audioBuffer, {
       callId: req.body.call_id,
-      language: req.body.language
+      language: req.body.language,
+      mimeType: req.file?.mimetype
     });
     res.json(result);
   } catch (err: any) {
@@ -422,22 +738,32 @@ app.post('/api/asr', upload.single('audio'), async (req: Request, res: Response)
   }
 });
 
-// 6. Serve generated / cached audio files
-app.get('/api/audio/:filename', (req: Request, res: Response) => {
+// 6. Serve generated / pre-recorded fallback audio files
+app.get('/api/audio/:filename', async (req: Request, res: Response) => {
   const rawParam = req.params.filename;
   const filename = Array.isArray(rawParam) ? rawParam[0] : (rawParam || '');
   const safeFilename = path.basename(filename);
-  const filePath = path.join(CONFIG.AUDIO.CACHE_DIR, safeFilename);
-  if (!fs.existsSync(filePath)) {
+  const resolvedPath = await waitForAudioFile(safeFilename, 3000);
+  if (!resolvedPath || !fs.existsSync(resolvedPath)) {
     return res.status(404).send('Audio file not found');
   }
-  const ext = path.extname(safeFilename).toLowerCase();
-  const mimeType = ext === '.wav' ? 'audio/wav' : (ext === '.ogg' ? 'audio/ogg' : 'audio/mpeg');
+  let mimeType = 'audio/wav';
+  try {
+    const head = Buffer.alloc(4);
+    const fd = fs.openSync(resolvedPath, 'r');
+    fs.readSync(fd, head, 0, 4, 0);
+    fs.closeSync(fd);
+    const magic = head.toString('ascii', 0, 4);
+    if (magic === 'RIFF') mimeType = 'audio/wav';
+    else if (magic === 'OggS') mimeType = 'audio/ogg';
+    else if (magic !== 'RIFF') mimeType = 'audio/mpeg';
+  } catch (_) {}
   res.setHeader('Content-Type', mimeType);
-  res.sendFile(filePath);
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(resolvedPath);
 });
 
-// 7. Mount Vite SPA in Dev or serve build in Prod
+// 7. Start HTTP Server + Asterisk AudioSocket Server
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
@@ -456,9 +782,18 @@ async function startServer() {
   }
 
   app.listen(CONFIG.PORT, CONFIG.HOST, () => {
-    console.log(`🚀 AI Call Assistant & Telephony Engine running on http://${CONFIG.HOST}:${CONFIG.PORT}`);
-    pregenerateStaticLines().catch((err: any) => console.warn('Pregeneration notice:', err.message));
+    console.log(`AI Call Assistant & Telephony Engine running on http://${CONFIG.HOST}:${CONFIG.PORT}`);
+    pregenerateStaticLines().catch((err: any) => console.warn('Fallback sync notice:', err.message));
   });
+
+  try {
+    const audioSocketServer = createAudioSocketServer(CONFIG.AUDIOSOCKET_PORT);
+    audioSocketServer.listen(CONFIG.AUDIOSOCKET_PORT, CONFIG.HOST, () => {
+      console.log(`Asterisk AudioSocket TCP Server listening on ${CONFIG.HOST}:${CONFIG.AUDIOSOCKET_PORT} (8kHz slin16)`);
+    });
+  } catch (err: any) {
+    console.warn('AudioSocket port bind notice:', err.message);
+  }
 }
 
 startServer().catch((err) => {

@@ -126,6 +126,7 @@ export interface WebhookTurnResult {
   confidence?: number;
   transfer?: ExtensionTransfer | null;
   timing_ms?: {
+    vad?: number;
     asr?: number;
     llm?: number;
     tts?: number;
@@ -144,7 +145,7 @@ export interface ChaosConfig {
   simulateAsrFail: boolean;
   simulateLlmFail: boolean;
   simulateTtsFail: boolean;
-  forceProvider: 'none' | 'groq' | 'gemini' | 'all_down';
+  forceProvider: 'none' | 'groq' | 'gemini' | 'openrouter' | 'all_down';
 }
 
 export interface AcceptanceTestItem {

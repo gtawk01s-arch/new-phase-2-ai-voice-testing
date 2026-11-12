@@ -22,22 +22,27 @@ export const AnalystScreen: React.FC = () => {
     forceProvider: 'none'
   });
 
-  // Automated 50 Tests Suite state (Phase 2 Task 10)
+  // Automated 8kHz Audio Acceptance Test Suite state
   const [isRunning50Tests, setIsRunning50Tests] = useState(false);
   const [testResults, setTestResults] = useState<{
     total: number;
     passed: number;
     failed: number;
+    p50Latency?: number;
     p95Latency: number;
+    legMedians?: { vad: number; asr: number; llm: number; tts: number };
     werHindi: string;
     werEnglish: string;
     items: Array<{
       id: number;
       category: string;
+      referenceText?: string;
       input: string;
       passed: boolean;
       reply: string;
       latency: number;
+      timings?: { vad?: number; asr?: number; llm?: number; tts?: number; total?: number };
+      werPct?: string;
     }>;
   } | null>(null);
 
@@ -121,168 +126,30 @@ export const AnalystScreen: React.FC = () => {
 
   // Export fine-tuning dataset
   const handleExportJsonl = () => {
-    window.open('/api/qa/export-finetuning', '_blank');
+    const link = document.createElement('a');
+    link.href = '/api/qa/export-finetuning';
+    link.download = 'finetuning-dataset.jsonl';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
-  // Run the 50 Scripted Acceptance Test Suite directly in browser
+  // Run the real 8kHz WAV Acceptance Test Suite via backend (/tests/recordings/en/*.wav & /tests/recordings/hi/*.wav)
   const run50AcceptanceTests = async () => {
     setIsRunning50Tests(true);
     setTestResults(null);
-
-    const testScenarios = [
-      // 1-5: Simple Yes / No
-      { cat: 'Yes/No Response', text: 'Yes, that sounds good.' },
-      { cat: 'Yes/No Response', text: 'No, that will not work for me.' },
-      { cat: 'Yes/No Response', text: 'Yeah, definitely.' },
-      { cat: 'Yes/No Response', text: 'Nope, not right now.' },
-      { cat: 'Yes/No Response', text: 'Sure, please go ahead.' },
-
-      // 6-10: Busy / Callback later
-      { cat: 'Busy / Callback', text: 'I am busy right now, can you call me back?' },
-      { cat: 'Busy / Callback', text: 'In a meeting at the moment, callback tomorrow.' },
-      { cat: 'Busy / Callback', text: 'Can not talk now, driving.' },
-      { cat: 'Busy / Callback', text: 'Please schedule an appointment for Friday morning.' },
-      { cat: 'Busy / Callback', text: 'Ring me back around 3 PM.' },
-
-      // 11-15: Angry / Frustrated Escalation
-      { cat: 'Angry Caller Escalation', text: 'This is completely unacceptable service, get me your manager!' },
-      { cat: 'Angry Caller Escalation', text: 'I am furious with this charge, let me speak to a supervisor right now!' },
-      { cat: 'Angry Caller Escalation', text: 'Your company is the worst, I want to talk to executive management.' },
-      { cat: 'Angry Caller Escalation', text: 'I am calling my lawyer if this is not resolved today!' },
-      { cat: 'Angry Caller Escalation', text: 'Ridiculous service, escalate this immediately.' },
-
-      // 16-23: Extension Transfers
-      { cat: 'PBX Extension Transfer', text: 'Please connect me to the billing and payments department.' },
-      { cat: 'PBX Extension Transfer', text: 'Transfer me to extension 102.' },
-      { cat: 'PBX Extension Transfer', text: 'I need technical support, my hardware device is completely broken.' },
-      { cat: 'PBX Extension Transfer', text: 'Transfer my call to technical escalations on extension 103.' },
-      { cat: 'PBX Extension Transfer', text: 'Can I speak with sales to buy a new account plan?' },
-      { cat: 'PBX Extension Transfer', text: 'Put me through to extension 104.' },
-      { cat: 'PBX Extension Transfer', text: 'Transfer me to customer care on extension 101.' },
-      { cat: 'PBX Extension Transfer', text: 'Route me to extension 200.' },
-
-      // 24-27: Do Not Call (DNC) Compliance
-      { cat: 'DNC Compliance', text: 'Stop calling me and remove my phone number immediately.' },
-      { cat: 'DNC Compliance', text: 'Put me on your do not call list right now.' },
-      { cat: 'DNC Compliance', text: 'Never call this number again.' },
-      { cat: 'DNC Compliance', text: 'Take me off your list and delete my number.' },
-
-      // 28-31: Silence & Audio Retry (Tests 2x repeat then transfer)
-      { cat: 'Silence / Low Energy', text: '' },
-      { cat: 'Silence / Low Energy', text: ' ' },
-      { cat: 'Silence / Low Energy', text: '...' },
-      { cat: 'Silence / Low Energy', text: '' },
-
-      // 32-35: Gibberish & Inaudible Speech
-      { cat: 'Gibberish / Noise', text: 'asldkjfh qwoeiru zxncbv' },
-      { cat: 'Gibberish / Noise', text: 'blablabla mmm hmm blorp' },
-      { cat: 'Gibberish / Noise', text: 'what is 15 percent tip on 84 dollars?' },
-      { cat: 'General Knowledge', text: 'What is the capital of Australia, and what is interesting about it?' },
-
-      // 36-40: Hindi Conversations (Tested with recordings)
-      { cat: 'Hindi Conversations', text: 'नमस्ते, आपकी रिटर्न पॉलिसी क्या है?' },
-      { cat: 'Hindi Conversations', text: 'मुझे बिलिंग विभाग में बात करनी है।' },
-      { cat: 'Hindi Conversations', text: 'क्या आप एक रोबोट हैं या असली इंसान?' },
-      { cat: 'Hindi Conversations', text: 'मुझे सपोर्ट सहायता एक्सटेंशन 101 पर ट्रांसफर करें।' },
-      { cat: 'Hindi Conversations', text: 'मुझे दोबारा कॉल मत करना, मेरा नंबर लिस्ट से हटाओ।' },
-
-      // 41-45: Hinglish Conversations
-      { cat: 'Hinglish Conversations', text: 'Hello, mujhe new plan purchase karna hai pricing kya hai?' },
-      { cat: 'Hinglish Conversations', text: 'Customer care executive se connect kar do please.' },
-      { cat: 'Hinglish Conversations', text: 'Technical issue aa raha hai, app kaam nahi kar raha.' },
-      { cat: 'Hinglish Conversations', text: 'Main bahut gussa hoon, manager se baat karao turant!' },
-      { cat: 'Hinglish Conversations', text: 'Invoice payment ki due date kab hoti hai?' },
-
-      // 46-50: Interruption / Barge-in & FAQs
-      { cat: 'Barge-In & Hours', text: 'Wait stop, what are your business hours this week?' },
-      { cat: 'Barge-In & Hours', text: 'Hold on, how do airplanes stay up in the sky in simple terms?' },
-      { cat: 'Barge-In & Hours', text: 'What is the speed of light?' },
-      { cat: 'Barge-In & Hours', text: 'How do I verify my account details?' },
-      { cat: 'Barge-In & Hours', text: 'Thank you for your help, have a wonderful day! Goodbye.' }
-    ];
-
-    const results: Array<{ id: number; category: string; input: string; passed: boolean; reply: string; latency: number }> = [];
-    let passedCount = 0;
-    const latencies: number[] = [];
-
-    const simCallId = `test-suite-${Date.now()}`;
-
-    // Start simulation session
-    await fetch('/api/dialer/call/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: simCallId, direction: 'inbound', campaign: 'support' })
-    }).catch(() => {});
-
-    for (let i = 0; i < testScenarios.length; i++) {
-      const scenario = testScenarios[i];
-      const t0 = Date.now();
-      try {
-        const res = await fetch('/api/dialer/call/interact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            call_id: simCallId,
-            text: scenario.text,
-            language: scenario.cat.includes('Hindi') ? 'hi' : (scenario.cat.includes('Hinglish') ? 'hi-Latn' : 'en')
-          })
-        });
-
-        const data = await res.json();
-        const duration = Date.now() - t0;
-        latencies.push(duration);
-
-        // Verification checks
-        let pass = false;
-        if (scenario.cat.includes('DNC')) {
-          pass = data.action === 'hangup' || data.disposition === 'DNC';
-        } else if (scenario.cat.includes('Angry')) {
-          pass = data.action === 'transfer' && data.transfer?.extension === '200';
-        } else if (scenario.cat.includes('Extension Transfer')) {
-          pass = data.action === 'transfer' || data.response.toLowerCase().includes('transfer');
-        } else if (scenario.cat.includes('Silence')) {
-          pass = data.response.toLowerCase().includes('repeat') || data.action === 'transfer';
-        } else {
-          pass = Boolean(data.response && data.response.length > 5);
-        }
-
-        if (pass) passedCount++;
-
-        results.push({
-          id: i + 1,
-          category: scenario.cat,
-          input: scenario.text || '(silence / inaudible)',
-          passed: pass,
-          reply: data.response || '(empty)',
-          latency: duration
-        });
-      } catch (err: any) {
-        results.push({
-          id: i + 1,
-          category: scenario.cat,
-          input: scenario.text,
-          passed: false,
-          reply: `Error: ${err.message}`,
-          latency: Date.now() - t0
-        });
+    try {
+      const res = await fetch('/api/qa/run-audio-suite', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data.items) {
+        setTestResults(data);
       }
+    } catch (err) {
+      console.warn('Failed to run 8kHz audio suite:', err);
+    } finally {
+      setIsRunning50Tests(false);
+      await fetchCallsAndChaos();
     }
-
-    latencies.sort((a, b) => a - b);
-    const p95 = latencies[Math.floor(latencies.length * 0.95)] || 450;
-
-    setTestResults({
-      total: testScenarios.length,
-      passed: passedCount,
-      failed: testScenarios.length - passedCount,
-      p95Latency: p95,
-      werHindi: '2.8%',
-      werEnglish: '1.4%',
-      items: results
-    });
-
-    setIsRunning50Tests(false);
-    await fetchCallsAndChaos();
   };
 
   const selectedCall = calls.find(c => c.callId === selectedCallId);
@@ -304,7 +171,7 @@ export const AnalystScreen: React.FC = () => {
             <h2 className="text-lg font-bold">QA Analyst & Telephony Compliance Dashboard</h2>
           </div>
           <p className="text-xs text-indigo-200 mt-1">
-            Audit recordings & transcripts • Flag hallucinations • Human transcript corrections feed model retraining • <strong>Tested with recordings</strong>
+            Audit call transcripts & per-leg latencies • Flag bad replies • Human transcript corrections feed JSONL retraining
           </p>
         </div>
 
@@ -329,33 +196,35 @@ export const AnalystScreen: React.FC = () => {
             }`}
           >
             <span>⚡</span>
-            <span>{isRunning50Tests ? 'Running 50 Tests...' : 'Run 50 Acceptance Tests'}</span>
+            <span>{isRunning50Tests ? 'Running 8kHz WAV Suite...' : 'Run 8kHz Audio Test Suite (20 WAVs)'}</span>
           </button>
         </div>
       </div>
 
-      {/* 50 Acceptance Tests Live Results Box */}
+      {/* Measured 8kHz WAV Acceptance Tests Results Box */}
       {testResults && (
         <div className="bg-slate-900 border border-emerald-500/40 rounded-2xl p-5 text-white shadow-xl">
           <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
             <div className="flex items-center gap-2">
-              <span className="text-2xl">✅</span>
+              <span className="text-2xl">{testResults.failed === 0 ? '✅' : '⚠️'}</span>
               <div>
                 <h3 className="font-bold text-base text-emerald-400">
-                  Acceptance Test Suite: {testResults.passed}/{testResults.total} Passed (100% Target Met)
+                  Measured 8kHz WAV Suite: {testResults.passed}/{testResults.total} Passed ({testResults.failed} Failed)
                 </h3>
-                <p className="text-xs text-slate-400">
-                  Tested with recordings only • Verified ASR, DNC, Hindi/Hinglish, Supervisor Transfers & Interruption
-                </p>
+                {testResults.legMedians && (
+                  <p className="text-xs text-slate-400 font-mono">
+                    Median Per-Leg Latency — VAD: {testResults.legMedians.vad}ms | ASR: {testResults.legMedians.asr}ms | LLM: {testResults.legMedians.llm}ms | TTS: {testResults.legMedians.tts}ms
+                  </p>
+                )}
               </div>
             </div>
 
-            <div className="flex items-center gap-4 text-xs font-mono">
+            <div className="flex items-center gap-3 text-xs font-mono flex-wrap">
               <span className="bg-emerald-500/20 text-emerald-300 px-3 py-1 rounded-lg border border-emerald-500/30">
-                p95 Latency: {testResults.p95Latency}ms
+                p50: {testResults.p50Latency ?? 0}ms | p95: {testResults.p95Latency}ms
               </span>
               <span className="bg-sky-500/20 text-sky-300 px-3 py-1 rounded-lg border border-sky-500/30">
-                WER (EN): {testResults.werEnglish} | (HI): {testResults.werHindi}
+                Measured WER (EN): {testResults.werEnglish} | (HI): {testResults.werHindi}
               </span>
             </div>
           </div>
@@ -369,12 +238,15 @@ export const AnalystScreen: React.FC = () => {
                 }`}
               >
                 <div className="flex-1">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-bold text-slate-400">#{item.id}</span>
                     <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 text-[10px] font-semibold">
                       {item.category}
                     </span>
-                    <span className="text-slate-300">Caller: "{item.input}"</span>
+                    <span className="text-slate-300">ASR: "{item.input}"</span>
+                    {item.werPct && (
+                      <span className="text-[10px] font-mono text-sky-400">WER: {item.werPct}</span>
+                    )}
                   </div>
                   <div className="text-slate-400 mt-1 pl-6">
                     Alex: <span className="text-slate-200">"{item.reply}"</span>
@@ -382,7 +254,11 @@ export const AnalystScreen: React.FC = () => {
                 </div>
 
                 <div className="flex items-center gap-2">
-                  <span className="text-slate-400 font-mono text-[11px]">{item.latency}ms</span>
+                  <span className="text-slate-400 font-mono text-[11px]">
+                    {item.timings
+                      ? `ASR:${item.timings.asr}ms LLM:${item.timings.llm}ms TTS:${item.timings.tts}ms (${item.latency}ms)`
+                      : `${item.latency}ms`}
+                  </span>
                   <span className={item.passed ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
                     {item.passed ? 'PASS' : 'FAIL'}
                   </span>
@@ -393,13 +269,13 @@ export const AnalystScreen: React.FC = () => {
         </div>
       )}
 
-      {/* Provider Chaos Injection Testing (Phase 2 Task 8: Kill each provider on purpose and show fallback works) */}
+      {/* Provider Chaos Injection Testing */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-white shadow-xl">
         <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
           <div className="flex items-center gap-2">
             <span className="text-lg">⚡</span>
             <h3 className="font-bold text-sm text-slate-200">
-              Provider Chaos & Failover Injection (Task 8: Prove Resilience)
+              Provider Chaos & Failover Injection (Non-Production / Chaos Mode)
             </h3>
           </div>
           <span className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2.5 py-1 rounded-full">
@@ -445,18 +321,19 @@ export const AnalystScreen: React.FC = () => {
               onChange={e => updateChaos({ forceProvider: e.target.value as any })}
               className="bg-slate-900 text-slate-200 border border-slate-700 rounded-lg px-2 py-1 text-xs"
             >
-              <option value="none">Auto (Groq/Gemini)</option>
-              <option value="groq">Force Groq</option>
+              <option value="none">Auto (Gemini/Groq/OpenRouter)</option>
               <option value="gemini">Force Gemini</option>
+              <option value="groq">Force Groq</option>
+              <option value="openrouter">Force OpenRouter</option>
               <option value="all_down">Kill All LLMs</option>
             </select>
           </div>
         </div>
 
         <p className="text-[11px] text-slate-400 mt-2">
-          • ASR Down: Triggers 2x "Could you repeat that?", then emergency human transfer.<br />
-          • LLM Down: Plays scripted apology and immediately transfers to specialist extension.<br />
-          • TTS Down: Plays guaranteed pre-cached telephone audio lines from local disk.
+          • ASR Down: Triggers 2x "Could you repeat that?", then transfers to Extension 101.<br />
+          • LLM Down: Plays single scripted apology and immediately transfers to Extension 101.<br />
+          • TTS Down: Plays pre-recorded spoken WAV fallback lines from /public/audio/fallbacks/.
         </p>
       </div>
 

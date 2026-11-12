@@ -1,20 +1,31 @@
 #!/usr/bin/env node
 
 /**
- * Phase 2 Reliability & Chaos Fallback Test Suite
- * Task 8:
- *  - ASR fails: "Could you repeat that?" twice, then transfer to a human.
- *  - All LLMs down: scripted reply, then transfer.
- *  - TTS fails: play a cached fallback line.
- *  - Chaos control: Kill each provider on purpose and verify fallback behavior.
- * 
- * IMPORTANT: No telephony access. All tests executed with recordings and simulator.
- * Official Report Status: Tested with recordings (never "live").
+ * Provider Failover & Chaos Verification Script
+ *
+ * Tests:
+ *  1. Webhook Authentication Enforcement (rejects unauthenticated requests with 401/503, accepts valid X-Shared-Secret)
+ *  2. TTS Outage (simulateTtsFail: true) -> Delivers pre-recorded spoken fallback WAV (> 20KB real speech, not a beep tone) in English and Hindi
+ *  3. All LLMs Down (simulateLlmFail: true) -> Plays single scripted apology line and transfers to specialist (Extension 101)
+ *  4. ASR Failure / 8kHz Silence WAV (`silence_8k.wav` uploaded 3 times) -> Asks "Could you repeat that?" twice, then transfers to human on 3rd failure
+ *  5. /health subsystem verification (ASR, LLM, TTS, Session store)
  */
 
-const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+import fs from 'fs';
+import path from 'path';
+import { CONFIG } from '../src/config.js';
 
-// Helper to set chaos state
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (WEBHOOK_SECRET) {
+    headers['X-Shared-Secret'] = WEBHOOK_SECRET;
+  }
+  return headers;
+}
+
 async function setChaos(config) {
   const res = await fetch(`${BASE_URL}/api/admin/chaos`, {
     method: 'POST',
@@ -25,197 +36,199 @@ async function setChaos(config) {
 }
 
 async function runFallbackTests() {
-  console.log(`========================================================================`);
-  console.log(`🛡️  PHASE 2 RELIABILITY & CHAOS FALLBACK TEST SUITE`);
-  console.log(`    Mode: Tested with recordings (Simulator PBX Engine)`);
-  console.log(`    Server: ${BASE_URL}`);
-  console.log(`========================================================================\n`);
+  console.log('========================================================================');
+  console.log('PROVIDER FAILOVER & SECURITY VERIFICATION');
+  console.log(`Server: ${BASE_URL}`);
+  console.log('========================================================================\n');
 
   let passed = 0;
   let total = 0;
 
   // -------------------------------------------------------------------------
-  // TEST 1: TTS Outage Fallback -> Returns Cached Fallback Line
+  // TEST 1: Webhook Security Enforcement
   // -------------------------------------------------------------------------
   total++;
-  console.log(`▶ TEST 1: TTS Outage Simulation (Kill TTS Provider)`);
+  console.log('▶ TEST 1: Webhook Authentication Enforcement (Default ON)');
   try {
-    // Enable TTS failure simulation
-    await setChaos({ simulateTtsFail: true });
-
-    // Request TTS synthesis
-    const ttsRes = await fetch(`${BASE_URL}/api/tts`, {
+    const unauthRes = await fetch(`${BASE_URL}/api/webhook/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'Testing cached audio fallback system.' })
+      body: JSON.stringify({ call_id: 'unauth-test', direction: 'inbound' })
     });
 
-    const isAudio = ttsRes.headers.get('content-type')?.includes('audio');
-    const isCachedFallback = ttsRes.headers.get('x-fallback-cached') === 'true';
-    const statusOk = ttsRes.status === 200;
-
-    if (statusOk && isAudio && isCachedFallback) {
-      console.log(`  ✅ PASSED: TTS failed gracefully. Delivered pre-generated cached fallback WAV audio.`);
-      console.log(`     Response Status: ${ttsRes.status}, Content-Type: ${ttsRes.headers.get('content-type')}, Header: X-Fallback-Cached=true`);
+    if (unauthRes.status === 401 || unauthRes.status === 503) {
+      console.log(`  PASS: Unauthenticated webhook call rejected with HTTP ${unauthRes.status}`);
       passed++;
     } else {
-      console.error(`  ❌ FAILED: Unexpected TTS response. status=${ttsRes.status}, isAudio=${isAudio}, cached=${isCachedFallback}`);
+      console.error(`  FAIL: Expected HTTP 401/503 without credentials, got HTTP ${unauthRes.status}`);
     }
   } catch (err) {
-    console.error(`  ❌ FAILED with error:`, err.message);
+    console.error('  FAIL:', err.message);
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 2: TTS Outage -> Pre-recorded Spoken Fallback Audio (EN & HI)
+  // -------------------------------------------------------------------------
+  total++;
+  console.log('\n▶ TEST 2: TTS Outage Simulation (Pre-recorded Spoken Audio in EN & HI)');
+  try {
+    await setChaos({ simulateTtsFail: true });
+
+    const ttsEnRes = await fetch(`${BASE_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Could you repeat that?', language: 'en' })
+    });
+    const enBytes = Buffer.from(await ttsEnRes.arrayBuffer());
+
+    const ttsHiRes = await fetch(`${BASE_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'क्षमा करें, क्या आप कृपया उसे दोहरा सकते हैं?', language: 'hi' })
+    });
+    const hiBytes = Buffer.from(await ttsHiRes.arrayBuffer());
+
+    const isEnCached = ttsEnRes.headers.get('x-fallback-cached') === 'true' && enBytes.length > 15000;
+    const isHiCached = ttsHiRes.headers.get('x-fallback-cached') === 'true' && hiBytes.length > 15000;
+
+    if (isEnCached && isHiCached) {
+      console.log(`  PASS: Delivered pre-recorded spoken WAV fallbacks (EN: ${enBytes.length} bytes, HI: ${hiBytes.length} bytes)`);
+      passed++;
+    } else {
+      console.error(`  FAIL: TTS fallback check failed (EN: ${enBytes.length}B cached=${isEnCached}, HI: ${hiBytes.length}B cached=${isHiCached})`);
+    }
+  } catch (err) {
+    console.error('  FAIL:', err.message);
   } finally {
     await setChaos({ simulateTtsFail: false });
   }
 
   // -------------------------------------------------------------------------
-  // TEST 2: All LLMs Down Outage -> Scripted Reply + Transfer
+  // TEST 3: All LLMs Down -> Single Scripted Reply + Immediate Transfer
   // -------------------------------------------------------------------------
   total++;
-  console.log(`\n▶ TEST 2: All LLMs Down Simulation (Kill LLM Provider)`);
+  console.log('\n▶ TEST 3: All LLMs Down Simulation (Scripted Reply + Transfer, No Canned Answers)');
   try {
-    // Enable LLM failure simulation
     await setChaos({ simulateLlmFail: true });
 
     const callId = `chaos-llm-${Date.now()}`;
     await fetch(`${BASE_URL}/api/webhook/call`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, direction: 'inbound', caller_id: '+15558889999' })
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ call_id: callId, direction: 'inbound', language: 'hi', campaign_id: 'support_hi' })
     });
 
-    // Send a turn while LLMs are killed
+    // Even if asked one of the old test questions ("What is 15% tip on 84?"), it MUST NOT return a canned answer;
+    // it MUST play the single scripted outage line and transfer.
     const turnRes = await fetch(`${BASE_URL}/api/webhook/turn`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         call_id: callId,
-        text: 'I need help checking my account status please.'
+        text: 'What is a 15 percent tip on 84 dollars?',
+        language: 'hi'
       })
     });
 
     const turnData = await turnRes.json();
-    console.log(`     Agent Reply: "${turnData.reply}"`);
-    console.log(`     Action: [${turnData.action}], Intent: [${turnData.intent}]`);
-    if (turnData.transfer) {
-      console.log(`     Transferred to Ext: ${turnData.transfer.extension} (${turnData.transfer.name})`);
-    }
+    console.log(`  Reply: "${turnData.reply}"`);
+    console.log(`  Action: ${turnData.action}, Disposition: ${turnData.disposition}, Transfer Ext: ${turnData.transfer?.extension}`);
 
-    const hasScriptedReply = turnData.reply && (
-      turnData.reply.toLowerCase().includes('technical difficulties') ||
-      turnData.reply.toLowerCase().includes('technical issue') ||
-      turnData.reply.toLowerCase().includes('specialist')
-    );
-    const isTransferred = turnData.action === 'transfer' && turnData.transfer && (
-      turnData.transfer.extension === '101' || turnData.transfer.id === '101'
-    );
+    const isTransferred = turnData.action === 'transfer' && turnData.disposition === 'llm_outage_transfer' && turnData.transfer?.extension === '101';
+    const notCanned = !String(turnData.reply || '').includes('12.60') && !String(turnData.reply || '').includes('twelve');
 
-    if (hasScriptedReply && isTransferred) {
-      console.log(`  ✅ PASSED: All LLMs down handled correctly. Generated scripted reply and emergency transfer to human agent.`);
+    if (isTransferred && notCanned) {
+      console.log('  PASS: All LLMs down played single scripted line and transferred to Ext 101 (no canned reply).');
       passed++;
     } else {
-      console.error(`  ❌ FAILED: Did not trigger scripted reply and transfer. reply=${turnData.reply}, action=${turnData.action}`);
+      console.error(`  FAIL: Expected transfer on LLM outage, got action=${turnData.action}, reply="${turnData.reply}"`);
     }
   } catch (err) {
-    console.error(`  ❌ FAILED with error:`, err.message);
+    console.error('  FAIL:', err.message);
   } finally {
     await setChaos({ simulateLlmFail: false });
   }
 
   // -------------------------------------------------------------------------
-  // TEST 3: ASR Fails: "Could you repeat that?" twice, then transfer to a human
+  // TEST 4: ASR Failure / 8kHz Silence WAV -> 2x Repeat, then 3rd Failure Transfer
   // -------------------------------------------------------------------------
   total++;
-  console.log(`\n▶ TEST 3: Consecutive ASR Failures ("Could you repeat that?" twice, then transfer)`);
+  console.log('\n▶ TEST 4: Consecutive ASR Failures with Real 8kHz Silence Audio File (2x Repeat -> 3rd Transfer)');
   try {
     const callId = `chaos-asr-${Date.now()}`;
     await fetch(`${BASE_URL}/api/webhook/call`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, direction: 'inbound', caller_id: '+15557776666' })
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ call_id: callId, direction: 'inbound', language: 'en', campaign_id: 'support' })
     });
 
-    // Turn 1: ASR Failure 1 (Empty text / silence / inaudible)
-    const turn1Res = await fetch(`${BASE_URL}/api/webhook/turn`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, text: '' })
-    });
-    const turn1 = await turn1Res.json();
-    console.log(`     [Fail 1] Caller: <inaudible/empty audio recording>`);
-    console.log(`     [Fail 1] Agent Reply: "${turn1.reply}"`);
+    const silencePath = path.join(CONFIG.AUDIO.RECORDINGS_DIR, 'silence_8k.wav');
+    const silenceBuf = fs.readFileSync(silencePath);
 
-    // Turn 2: ASR Failure 2
-    const turn2Res = await fetch(`${BASE_URL}/api/webhook/turn`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, text: '' })
-    });
-    const turn2 = await turn2Res.json();
-    console.log(`     [Fail 2] Caller: <inaudible/empty audio recording>`);
-    console.log(`     [Fail 2] Agent Reply: "${turn2.reply}"`);
+    const sendSilenceTurn = async () => {
+      const form = new FormData();
+      form.append('call_id', callId);
+      form.append('language', 'en');
+      form.append('audio', new Blob([silenceBuf], { type: 'audio/wav' }), 'silence_8k.wav');
+      const r = await fetch(`${BASE_URL}/api/webhook/turn`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: form
+      });
+      return r.json();
+    };
 
-    // Turn 3: ASR Failure 3 (Threshold reached -> must transfer)
-    const turn3Res = await fetch(`${BASE_URL}/api/webhook/turn`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, text: '' })
-    });
-    const turn3 = await turn3Res.json();
-    console.log(`     [Fail 3] Caller: <inaudible/empty audio recording>`);
-    console.log(`     [Fail 3] Agent Reply: "${turn3.reply}"`);
-    console.log(`     [Fail 3] Action: [${turn3.action}], Transfer: ${JSON.stringify(turn3.transfer)}`);
+    const t1 = await sendSilenceTurn();
+    const t2 = await sendSilenceTurn();
+    const t3 = await sendSilenceTurn();
 
-    const turn1Repeat = turn1.reply.toLowerCase().includes('repeat') || turn1.reply.toLowerCase().includes('hear you');
-    const turn2Repeat = turn2.reply.toLowerCase().includes('repeat') || turn2.reply.toLowerCase().includes('hear you');
-    const turn3Transfer = turn3.action === 'transfer' && turn3.transfer;
+    console.log(`  Attempt 1: action=${t1.action}, reply="${t1.reply}"`);
+    console.log(`  Attempt 2: action=${t2.action}, reply="${t2.reply}"`);
+    console.log(`  Attempt 3: action=${t3.action}, transfer_ext=${t3.transfer?.extension}, reply="${t3.reply}"`);
 
-    if (turn1Repeat && turn2Repeat && turn3Transfer) {
-      console.log(`  ✅ PASSED: ASR failures gave "Could you repeat that?" twice, and transferred to human on third failure.`);
+    const ok1 = t1.action === 'speak_and_listen' && t1.reply?.toLowerCase().includes('repeat');
+    const ok2 = t2.action === 'speak_and_listen' && t2.reply?.toLowerCase().includes('repeat');
+    const ok3 = t3.action === 'transfer' && t3.transfer?.extension === '101';
+
+    if (ok1 && ok2 && ok3) {
+      console.log('  PASS: 8kHz silence WAV triggered "Could you repeat that?" twice and transferred on 3rd attempt.');
       passed++;
     } else {
-      console.error(`  ❌ FAILED: ASR retry sequence failed. t1Repeat=${turn1Repeat}, t2Repeat=${turn2Repeat}, t3Transfer=${turn3Transfer}`);
+      console.error(`  FAIL: Unexpected sequence ok1=${ok1}, ok2=${ok2}, ok3=${ok3}`);
     }
   } catch (err) {
-    console.error(`  ❌ FAILED with error:`, err.message);
+    console.error('  FAIL:', err.message);
   }
 
   // -------------------------------------------------------------------------
-  // TEST 4: Subsystem Health Check (/health)
+  // TEST 5: /health Subsystem Verification
   // -------------------------------------------------------------------------
   total++;
-  console.log(`\n▶ TEST 4: Subsystem Health Monitoring (/health checks ASR, TTS, LLM)`);
+  console.log('\n▶ TEST 5: /health Subsystem Check');
   try {
-    const healthRes = await fetch(`${BASE_URL}/health`);
-    const health = await healthRes.json();
-    console.log(`     Health Status: ${health.status}`);
-    console.log(`     Subsystems: ASR: ${health.subsystems?.asr?.status}, TTS: ${health.subsystems?.tts?.status}, LLM: ${health.subsystems?.llm?.status}`);
-
-    if (health.subsystems?.asr && health.subsystems?.tts && health.subsystems?.llm) {
-      console.log(`  ✅ PASSED: /health correctly monitors and reports status for ASR, TTS, and LLM engines.`);
+    const res = await fetch(`${BASE_URL}/health`);
+    const health = await res.json();
+    const ok = Boolean(health.subsystems?.asr && health.subsystems?.llm && health.subsystems?.tts && health.subsystems?.sessions);
+    if (ok) {
+      console.log(`  PASS: /health status=${health.status}, pre-recorded fallbacks=${health.subsystems.tts.prerecorded_fallback_files?.length}`);
       passed++;
     } else {
-      console.error(`  ❌ FAILED: Health endpoint missing subsystem diagnostics.`);
+      console.error('  FAIL: Missing subsystem fields in /health');
     }
   } catch (err) {
-    console.error(`  ❌ FAILED with error:`, err.message);
+    console.error('  FAIL:', err.message);
   }
 
-  // -------------------------------------------------------------------------
-  // FINAL SUMMARY
-  // -------------------------------------------------------------------------
-  console.log(`\n========================================================================`);
-  console.log(`📊 CHAOS & FALLBACK TEST REPORT`);
-  console.log(`   Scope: Tested with recordings`);
-  console.log(`   Result: ${passed}/${total} Fallback Tests Passed (100%)`);
-  console.log(`   Status: Fallbacks Proven`);
-  console.log(`========================================================================\n`);
+  console.log('\n========================================================================');
+  console.log(`RESULT: ${passed}/${total} Tests Passed`);
+  console.log('========================================================================\n');
 
   if (passed !== total) {
     process.exit(1);
   }
 }
 
-runFallbackTests().catch(err => {
-  console.error('Test execution failed:', err);
+runFallbackTests().catch((err) => {
+  console.error('Fallback test error:', err);
   process.exit(1);
 });

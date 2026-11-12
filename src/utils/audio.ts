@@ -134,6 +134,8 @@ export function playCallChime(isConnect = true): void {
 }
 
 let activePlaybackAudio: HTMLAudioElement | null = null;
+let sharedAudioElement: HTMLAudioElement | null = null;
+let activeBufferSource: AudioBufferSourceNode | null = null;
 let currentPlaySessionId = 0;
 let activeUtterance: SpeechSynthesisUtterance | null = null;
 let utteranceKeepAliveTimer: any = null;
@@ -155,6 +157,15 @@ export function stopSpeechAudio(): void {
     utteranceKeepAliveTimer = null;
   }
 
+  if (activeBufferSource) {
+    try {
+      activeBufferSource.onended = null;
+      activeBufferSource.stop();
+      activeBufferSource.disconnect();
+    } catch (e) {}
+    activeBufferSource = null;
+  }
+
   if (activePlaybackAudio) {
     try {
       activePlaybackAudio.onended = null;
@@ -162,7 +173,6 @@ export function stopSpeechAudio(): void {
       activePlaybackAudio.onpause = null;
       activePlaybackAudio.pause();
       activePlaybackAudio.currentTime = 0;
-      activePlaybackAudio.src = '';
     } catch (e) {}
     activePlaybackAudio = null;
   }
@@ -202,23 +212,55 @@ export function unlockAudioPlayback(): void {
       ctx.resume().catch(() => {});
     }
 
-    // 1. Prime HTML5 Audio element under user gesture
-    try {
-      const silentAudio = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
-      silentAudio.volume = 0.001;
-      silentAudio.play().then(() => {
-        silentAudio.pause();
-      }).catch(() => {});
-    } catch (e) {}
+    // 1. Prime persistent HTML5 Audio element under user gesture
+    if (typeof window !== 'undefined') {
+      try {
+        if (!sharedAudioElement) {
+          sharedAudioElement = new Audio();
+          sharedAudioElement.preload = 'auto';
+        }
+        // Only play silent WAV if nothing is currently playing on sharedAudioElement
+        if (sharedAudioElement.paused || sharedAudioElement.ended) {
+          sharedAudioElement.src =
+            'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+          sharedAudioElement.volume = 0.01;
+          sharedAudioElement
+            .play()
+            .then(() => {
+              if (sharedAudioElement && sharedAudioElement.src.startsWith('data:audio/wav')) {
+                sharedAudioElement.pause();
+                sharedAudioElement.volume = 1.0;
+              }
+            })
+            .catch(() => {});
+        }
+      } catch (e) {}
+    }
 
-    // 2. Prime Web Speech API Synthesis under user gesture (clean cancel & resume without empty space token)
+    // 2. Prime Web Speech API Synthesis under user gesture
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       try {
-        window.speechSynthesis.cancel();
         window.speechSynthesis.resume();
       } catch (e) {}
     }
   } catch (e) {}
+}
+
+// Automatically unlock audio on first user interaction anywhere in the document
+if (typeof window !== 'undefined') {
+  const autoUnlock = () => {
+    try {
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      if (!sharedAudioElement) {
+        unlockAudioPlayback();
+      }
+    } catch (e) {}
+  };
+  window.addEventListener('pointerdown', autoUnlock, { passive: true });
+  window.addEventListener('keydown', autoUnlock, { passive: true });
 }
 
 export const unlockAudioContext = unlockAudioPlayback;
@@ -266,6 +308,7 @@ export function playVoiceAudio(
           utteranceKeepAliveTimer = null;
         }
         activePlaybackAudio = null;
+        activeBufferSource = null;
         if (activeUtterance) {
           activeUtterancesSet.delete(activeUtterance);
           activeUtterance = null;
@@ -276,10 +319,10 @@ export function playVoiceAudio(
 
     // Dynamic safety timeout based on word count (so agent never hangs if browser audio event is dropped)
     const words = (text || '').trim().split(/\s+/).filter(Boolean).length;
-    const safetyDurationMs = Math.max(3500, Math.min(18000, words * 450 + 2000));
+    const safetyDurationMs = Math.max(4000, Math.min(20000, words * 450 + 2500));
     safetyTimeout = setTimeout(complete, safetyDurationMs);
 
-    // Browser Web Speech API synthesis
+    // Browser Web Speech API synthesis fallback
     const speakViaBrowserSynthesis = () => {
       if (sessionId !== currentPlaySessionId) return;
 
@@ -301,7 +344,7 @@ export function playVoiceAudio(
           return;
         }
 
-        // Small 60ms delay ensures Chromium background audio thread has finished cancel() teardown
+        // Small 50ms delay ensures Chromium background audio thread has finished cancel() teardown
         setTimeout(() => {
           if (sessionId !== currentPlaySessionId) return;
 
@@ -368,7 +411,6 @@ export function playVoiceAudio(
               }
             };
 
-            // Ensure synthesis is not paused before dispatching speak
             if (window.speechSynthesis.paused) {
               window.speechSynthesis.resume();
             }
@@ -377,7 +419,6 @@ export function playVoiceAudio(
             window.speechSynthesis.speak(utterance);
             window.speechSynthesis.resume();
 
-            // Chromium watchdog: if onstart hasn't fired in 250ms, wake up synthesis with resume()
             const watchdog = setTimeout(() => {
               if (sessionId === currentPlaySessionId && !startFired) {
                 try {
@@ -386,7 +427,6 @@ export function playVoiceAudio(
               }
             }, 250);
 
-            // Chromium keepalive: periodically resume so long sentences are not cut off
             utteranceKeepAliveTimer = setInterval(() => {
               if (sessionId !== currentPlaySessionId) {
                 clearInterval(utteranceKeepAliveTimer);
@@ -412,94 +452,168 @@ export function playVoiceAudio(
       }
     };
 
-    // If server provided an audio URL:
-    if (audioUrl) {
-      // 1. Try Web Audio API decode & playback first (immune to Chromium HTML5 autoplay block)
-      let webAudioAttempted = false;
-      const ctx = getAudioContext();
-      if (ctx && (ctx.state === 'running' || ctx.state === 'suspended')) {
-        webAudioAttempted = true;
-        if (ctx.state === 'suspended') {
-          ctx.resume().catch(() => {});
-        }
-        fetch(audioUrl)
-          .then((res) => {
-            if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
-            return res.arrayBuffer();
-          })
-          .then((buf) => ctx.decodeAudioData(buf))
-          .then((decoded) => {
-            if (sessionId !== currentPlaySessionId) return;
-            const source = ctx.createBufferSource();
-            source.buffer = decoded;
-            source.connect(ctx.destination);
-            isSpeechCurrentlySpeaking = true;
-            source.onended = () => {
-              if (sessionId === currentPlaySessionId) {
-                isSpeechCurrentlySpeaking = false;
-                complete();
-              }
-            };
-            source.start(0);
-          })
-          .catch((decodeErr) => {
-            if (sessionId === currentPlaySessionId) {
-              console.warn('Web Audio buffer playback note, trying HTML5 Audio:', decodeErr?.message);
-              playViaHtml5Audio();
-            }
-          });
-      }
+    // Helper to play via HTMLAudioElement (using unlocked sharedAudioElement if available)
+    const playViaHtmlAudio = (srcUrl: string) => {
+      if (sessionId !== currentPlaySessionId) return;
+      try {
+        const audio = sharedAudioElement || new Audio();
+        sharedAudioElement = audio;
+        activePlaybackAudio = audio;
+        audio.volume = 1.0;
+        audio.muted = false;
+        audio.src = srcUrl;
 
-      function playViaHtml5Audio() {
-        if (sessionId !== currentPlaySessionId) return;
-        try {
-          const audio = new Audio(audioUrl);
-          activePlaybackAudio = audio;
+        audio.onended = () => {
+          if (sessionId === currentPlaySessionId) {
+            isSpeechCurrentlySpeaking = false;
+            complete();
+          }
+        };
+        audio.onerror = () => {
+          if (sessionId === currentPlaySessionId) {
+            speakViaBrowserSynthesis();
+          }
+        };
 
-          audio.onplay = () => {
+        isSpeechCurrentlySpeaking = true;
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {
             if (sessionId === currentPlaySessionId) {
-              isSpeechCurrentlySpeaking = true;
-            }
-          };
-
-          audio.onended = () => {
-            if (sessionId === currentPlaySessionId) {
-              activePlaybackAudio = null;
-              isSpeechCurrentlySpeaking = false;
-              complete();
-            }
-          };
-
-          audio.onerror = () => {
-            if (sessionId === currentPlaySessionId) {
-              console.warn('Audio URL playback failed, falling back to browser speech synthesis');
-              activePlaybackAudio = null;
-              isSpeechCurrentlySpeaking = false;
               speakViaBrowserSynthesis();
             }
-          };
-
-          const playPromise = audio.play();
-          if (playPromise !== undefined) {
-            playPromise.catch((err) => {
-              if (sessionId === currentPlaySessionId) {
-                console.warn('Audio play rejection, falling back to browser speech synthesis:', err?.message);
-                activePlaybackAudio = null;
-                isSpeechCurrentlySpeaking = false;
-                speakViaBrowserSynthesis();
-              }
-            });
-          }
-        } catch (e) {
-          speakViaBrowserSynthesis();
+          });
         }
+      } catch (e) {
+        speakViaBrowserSynthesis();
       }
+    };
 
-      if (!webAudioAttempted) {
-        playViaHtml5Audio();
-      }
+    // If server provided an audio URL (and it is not a sine-tone fallback file):
+    if (audioUrl && !audioUrl.includes('fallback-')) {
+      const fetchWithTimeout = Promise.race([
+        fetch(audioUrl).then(async (res) => {
+          if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
+          const contentType = res.headers.get('content-type') || 'audio/mpeg';
+          const buf = await res.arrayBuffer();
+          if (!buf || buf.byteLength < 256) throw new Error('Empty audio buffer');
+          return { buf, contentType };
+        }),
+        new Promise<{ buf: ArrayBuffer; contentType: string }>((_, reject) =>
+          setTimeout(() => reject(new Error('Audio fetch timeout')), 2500)
+        )
+      ]);
+
+      fetchWithTimeout
+        .then(async ({ buf, contentType }) => {
+          if (sessionId !== currentPlaySessionId) return;
+
+          const ctx = getAudioContext();
+          if (ctx && ctx.state === 'suspended') {
+            try {
+              await Promise.race([
+                ctx.resume(),
+                new Promise((_, r) => setTimeout(r, 150))
+              ]);
+            } catch (e) {}
+          }
+
+          // Only use Web Audio API if AudioContext is actively running!
+          if (ctx && ctx.state === 'running') {
+            try {
+              const decoded = await ctx.decodeAudioData(buf.slice(0));
+              if (sessionId !== currentPlaySessionId) return;
+              const source = ctx.createBufferSource();
+              source.buffer = decoded;
+              source.connect(ctx.destination);
+              activeBufferSource = source;
+              isSpeechCurrentlySpeaking = true;
+              source.onended = () => {
+                if (sessionId === currentPlaySessionId) {
+                  isSpeechCurrentlySpeaking = false;
+                  complete();
+                }
+              };
+              source.start(0);
+              return;
+            } catch (decodeErr) {
+              // Fall through to HTMLAudioElement blob playback
+            }
+          }
+
+          // Play via unlocked HTMLAudioElement using a Blob URL
+          const blob = new Blob([buf], { type: contentType });
+          const blobUrl = URL.createObjectURL(blob);
+          playViaHtmlAudio(blobUrl);
+        })
+        .catch(() => {
+          if (sessionId === currentPlaySessionId) {
+            speakViaBrowserSynthesis();
+          }
+        });
     } else {
       speakViaBrowserSynthesis();
     }
   });
 }
+
+/**
+ * Convert a recorded MediaRecorder Blob (e.g. audio/webm;codecs=opus) into a clean 16kHz 16-bit mono PCM WAV Blob
+ * and compute RMS vocal energy so silent clips can be filtered out on the client.
+ */
+export async function blobToWav16k(
+  blob: Blob
+): Promise<{ wavBlob: Blob; rms: number; durationSec: number }> {
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) {
+      return { wavBlob: blob, rms: 0.05, durationSec: 1.0 };
+    }
+    const arrayBuf = await blob.arrayBuffer();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuf.slice(0));
+    const durationSec = audioBuffer.duration;
+    const targetRate = 16000;
+    const numSamples = Math.max(1, Math.floor(durationSec * targetRate));
+    const channelData = audioBuffer.getChannelData(0);
+    const ratio = channelData.length / numSamples;
+
+    const wavBuffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuffer);
+
+    const writeStr = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM chunk size
+    view.setUint16(20, 1, true); // PCM format
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, targetRate, true);
+    view.setUint32(28, targetRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+
+    let sumSq = 0;
+    for (let i = 0; i < numSamples; i++) {
+      const srcIdx = Math.min(channelData.length - 1, Math.floor(i * ratio));
+      const sample = Math.max(-1, Math.min(1, channelData[srcIdx] || 0));
+      sumSq += sample * sample;
+      const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(44 + i * 2, int16, true);
+    }
+
+    const rms = Math.sqrt(sumSq / numSamples);
+    const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+    return { wavBlob, rms, durationSec };
+  } catch (err) {
+    return { wavBlob: blob, rms: 0.05, durationSec: 1.0 };
+  }
+}
+

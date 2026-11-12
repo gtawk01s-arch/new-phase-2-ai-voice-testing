@@ -3,11 +3,12 @@ import { Header } from './components/Header';
 import { LiveVoiceAssistant } from './components/LiveVoiceAssistant';
 import { DialerSimulator } from './components/DialerSimulator';
 import { AnalystScreen } from './components/AnalystScreen';
+import { SovereignPlanScreen } from './components/SovereignPlanScreen';
 import { WebhookContract } from './components/WebhookContract';
 import { Extension } from './types';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'voice' | 'dialer' | 'qa' | 'api'>('voice');
+  const [activeTab, setActiveTab] = useState<'voice' | 'dialer' | 'qa' | 'sovereign' | 'api'>('sovereign');
 
   // Triggered by Dialer Simulator to start Inbound Call
   const handleStartInbound = async (callerId: string, greeting: string) => {
@@ -64,7 +65,7 @@ export const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-950 p-3 sm:p-6 flex justify-center items-start text-slate-800 font-sans">
-      <div className="bg-white rounded-3xl shadow-2xl max-w-4xl w-full overflow-hidden flex flex-col my-3 sm:my-6 border border-slate-700/30">
+      <div className="bg-white rounded-3xl shadow-2xl max-w-5xl w-full overflow-hidden flex flex-col my-3 sm:my-6 border border-slate-700/30">
         <Header activeTab={activeTab} onTabChange={setActiveTab} />
 
         <div className="p-5 sm:p-8">
@@ -82,12 +83,14 @@ export const App: React.FC = () => {
 
           {activeTab === 'qa' && <AnalystScreen />}
 
+          {activeTab === 'sovereign' && <SovereignPlanScreen />}
+
           {activeTab === 'api' && <WebhookContract />}
         </div>
 
         {/* Footer */}
         <div className="px-6 py-4 border-t border-slate-100 bg-slate-50/50 text-center text-xs text-slate-400">
-          AI Call Assistant & Telephony PBX Engine • Built with React, Vite & Express
+          AI Call Assistant &amp; Sovereign GPU Telephony PBX Engine • Built with React, Vite &amp; Express
         </div>
       </div>
     </div>
@@ -95,3 +98,4 @@ export const App: React.FC = () => {
 };
 
 export default App;
+

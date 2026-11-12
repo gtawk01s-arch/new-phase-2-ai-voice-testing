@@ -1,4 +1,4 @@
-import { CONFIG, CHAOS_STATE, getCampaign, getLanguage } from '../../src/config.js';
+import { CONFIG, CHAOS_STATE, isChaosAllowed, getCampaign } from '../../src/config.js';
 import {
   getOrCreateSession,
   getSession,
@@ -50,32 +50,35 @@ export default async function handler(req: Request) {
   }
 
   try {
-    // 1. Healthcheck checking ASR, TTS, LLM (Phase 2 Task 8)
+    // 1. Healthcheck checking ASR, TTS, LLM
     if (pathname === '/api/health' || pathname === '/health') {
       const latency = getGlobalLatencyMetrics();
       const providers = getProviderCounters();
+      const chaosActive = isChaosAllowed();
       return jsonResponse({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        version: '2.0.0',
+        version: '2.1.0',
         platform: 'netlify-functions',
-        mode: 'tested with recordings',
+        webhook_auth_enforced: CONFIG.SECURITY.ENFORCE_AUTH,
         subsystems: {
           asr: {
-            status: CHAOS_STATE.simulateAsrFail ? 'simulated_failure' : (CONFIG.GROQ_API_KEY ? 'ready' : 'unconfigured'),
-            primary: 'groq/whisper-large-v3-turbo'
+            status: (chaosActive && CHAOS_STATE.simulateAsrFail) ? 'simulated_failure' : ((CONFIG.GROQ_API_KEY || CONFIG.GEMINI_API_KEY) ? 'ready' : 'unconfigured'),
+            providers: ['groq/whisper-large-v3-turbo', 'gemini/gemini-3-flash-preview', 'gemini/gemini-3.5-transcribe']
           },
           llm: {
-            status: CHAOS_STATE.simulateLlmFail ? 'simulated_failure' : (CONFIG.GROQ_API_KEY ? 'ready' : 'degraded'),
+            status: (chaosActive && CHAOS_STATE.simulateLlmFail) ? 'simulated_failure' : ((CONFIG.GEMINI_API_KEY || CONFIG.GROQ_API_KEY || CONFIG.OPENROUTER_API_KEY) ? 'ready' : 'degraded'),
             active_models: CONFIG.GROQ_MODELS,
+            openrouter_models: CONFIG.OPENROUTER_MODELS,
             metrics: providers
           },
           tts: {
-            status: CHAOS_STATE.simulateTtsFail ? 'simulated_failure' : 'ready',
+            status: (chaosActive && CHAOS_STATE.simulateTtsFail) ? 'simulated_failure' : 'ready',
             fallback_cached: true
           }
         },
-        chaos_mode: CHAOS_STATE,
+        chaos_enabled: chaosActive,
+        chaos_mode: chaosActive ? CHAOS_STATE : undefined,
         latency: {
           target_ms: CONFIG.TIMEOUTS.TOTAL_BUDGET,
           p50_ms: latency.p50,
@@ -86,17 +89,20 @@ export default async function handler(req: Request) {
       });
     }
 
-    // 2. Admin Chaos Injection (kill providers on purpose to show fallbacks)
+    // 2. Admin Chaos Injection (gated behind isChaosAllowed())
     if (pathname === '/api/admin/chaos') {
       if (req.method === 'GET') {
-        return jsonResponse({ status: 'ok', chaos: CHAOS_STATE });
+        return jsonResponse({ status: 'ok', chaos_allowed: isChaosAllowed(), chaos: CHAOS_STATE });
       }
       if (req.method === 'POST') {
+        if (!isChaosAllowed()) {
+          return jsonResponse({ error: 'Chaos injection disabled in production.' }, 403);
+        }
         const body = await req.json().catch(() => ({}));
         if (typeof body.simulateAsrFail === 'boolean') CHAOS_STATE.simulateAsrFail = body.simulateAsrFail;
         if (typeof body.simulateLlmFail === 'boolean') CHAOS_STATE.simulateLlmFail = body.simulateLlmFail;
         if (typeof body.simulateTtsFail === 'boolean') CHAOS_STATE.simulateTtsFail = body.simulateTtsFail;
-        if (['none', 'groq', 'gemini', 'all_down'].includes(body.forceProvider)) {
+        if (['none', 'groq', 'gemini', 'openrouter', 'all_down'].includes(body.forceProvider)) {
           CHAOS_STATE.forceProvider = body.forceProvider;
         }
         return jsonResponse({ status: 'updated', chaos: CHAOS_STATE });

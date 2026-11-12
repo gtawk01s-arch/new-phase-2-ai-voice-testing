@@ -10,7 +10,8 @@ import {
   unlockAudioContext,
   unlockAudioPlayback,
   resumeAudioAndSpeech,
-  isAudioPlaying
+  isAudioPlaying,
+  blobToWav16k
 } from '../utils/audio';
 import { MessageItem } from '../types';
 import { generateBrowserVoiceResponse } from '../utils/browserVoiceEngine';
@@ -34,6 +35,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const [isSpeakerOn, setIsSpeakerOn] = useState(true);
   const [isKeypadOpen, setIsKeypadOpen] = useState(false);
   const [dialedDigits, setDialedDigits] = useState('');
+  const [selectedLanguage, setSelectedLanguage] = useState<'en' | 'hi' | 'hi-Latn'>('en');
   const [selectedVoice, setSelectedVoice] = useState('en-US-JennyNeural');
   const [bargeInNotice, setBargeInNotice] = useState(false);
 
@@ -67,6 +69,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const isMutedRef = useRef(false);
   const isSpeakerOnRef = useRef(true);
   const isStandaloneModeRef = useRef(false);
+  const selectedLanguageRef = useRef<'en' | 'hi' | 'hi-Latn'>('en');
+  const selectedVoiceRef = useRef('en-US-JennyNeural');
   const currentCallIdRef = useRef(currentCallId);
   const activeMicStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -81,6 +85,9 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   const recordingStartTimeRef = useRef<number>(0);
   const vadSilenceTimeoutRef = useRef<any>(null);
   const isVadRecordingRef = useRef(false);
+  const isManualRecordingRef = useRef(false);
+  const hasSpokenInRecordingRef = useRef(false);
+  const speechFramesInRecordingRef = useRef<number>(0);
   const speechRecognitionRef = useRef<any>(null);
   const speechSilenceTimeoutRef = useRef<any>(null);
   const currentRecognizedTextRef = useRef<string>('');
@@ -93,6 +100,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
   useEffect(() => { isSpeakerOnRef.current = isSpeakerOn; }, [isSpeakerOn]);
   useEffect(() => { isStandaloneModeRef.current = isStandaloneMode; }, [isStandaloneMode]);
+  useEffect(() => { selectedLanguageRef.current = selectedLanguage; }, [selectedLanguage]);
+  useEffect(() => { selectedVoiceRef.current = selectedVoice; }, [selectedVoice]);
   useEffect(() => { currentCallIdRef.current = currentCallId; }, [currentCallId]);
 
   // Scroll to bottom of conversation
@@ -188,48 +197,55 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
             const now = Date.now();
             const isPlaying = isAgentSpeakingRef.current || isAudioPlaying();
-            const isInEchoCooldown = (now - agentFinishedSpeakingTimeRef.current) < 400;
+            const isInEchoCooldown = (now - agentFinishedSpeakingTimeRef.current) < 450;
 
-            // Acoustic Barge-In interrupt check:
-            // Natural conversational threshold (32%) across 2 frames allows caller to easily interrupt Alex
-            if (isPlaying && voicePct >= 32 && !isMutedRef.current && !isInEchoCooldown) {
-              speechFrameCounterRef.current = (speechFrameCounterRef.current || 0) + 1;
-              if (speechFrameCounterRef.current >= 2) {
-                handleBargeIn();
-              }
-            }
-
-            // Hands-Free VAD (Voice Activity Detection):
-            // Web SpeechRecognition provides real-time streaming speech-to-text (< 200ms);
-            // MediaRecorder VAD concurrently buffers audio as a fail-safe in case browser speech recognition drops words
+            // Hands-Free VAD (Voice Activity Detection) & Manual PTT silence detection
+            // (Only active when Alex is NOT speaking, preventing speaker echo from cutting off Alex's voice)
             if (
-              isInCallRef.current &&
-              isHandsfreeRef.current &&
               !isMutedRef.current &&
               !isPlaying &&
               !isCommittingTurnRef.current &&
-              !isInEchoCooldown
+              !isInEchoCooldown &&
+              (isManualRecordingRef.current || (isInCallRef.current && isHandsfreeRef.current))
             ) {
-              if (voicePct >= 6) {
-                // Speech energy detected in human vocal range: require sustained energy (2 frames)
+              if (voicePct >= 16) {
                 speechFrameCounterRef.current = (speechFrameCounterRef.current || 0) + 1;
-                if (speechFrameCounterRef.current >= 2 && !isVadRecordingRef.current) {
+                if (isVadRecordingRef.current || isManualRecordingRef.current) {
+                  speechFramesInRecordingRef.current = (speechFramesInRecordingRef.current || 0) + 1;
+                  if (speechFramesInRecordingRef.current >= 3) {
+                    hasSpokenInRecordingRef.current = true;
+                  }
+                } else if (
+                  isInCallRef.current &&
+                  isHandsfreeRef.current &&
+                  speechFrameCounterRef.current >= 4
+                ) {
+                  // Sustained vocal energy (~70ms) triggers Hands-Free VAD recording
                   startMediaRecording(false);
+                  hasSpokenInRecordingRef.current = true;
+                  speechFramesInRecordingRef.current = speechFrameCounterRef.current;
                 }
-                // Reset silence countdown while user is speaking
+
+                // Reset silence countdown while user is actively speaking
                 if (vadSilenceTimeoutRef.current) {
                   clearTimeout(vadSilenceTimeoutRef.current);
                   vadSilenceTimeoutRef.current = null;
                 }
               } else {
                 speechFrameCounterRef.current = 0;
-                if (isVadRecordingRef.current && voicePct < 4) {
-                  // Volume dropped: wait for 420ms silence before endpointing speech
+                const isCurrentlyRecording = isVadRecordingRef.current || isManualRecordingRef.current;
+                // Only start silence endpoint timer AFTER the user has actually spoken (or for auto-VAD)
+                if (
+                  isCurrentlyRecording &&
+                  voicePct < 9 &&
+                  (hasSpokenInRecordingRef.current || !isManualRecordingRef.current)
+                ) {
                   if (!vadSilenceTimeoutRef.current) {
+                    const silenceWaitMs = isManualRecordingRef.current ? 1200 : 1050;
                     vadSilenceTimeoutRef.current = setTimeout(() => {
                       vadSilenceTimeoutRef.current = null;
                       stopMediaRecordingAndSend();
-                    }, 420);
+                    }, silenceWaitMs);
                   }
                 }
               }
@@ -437,7 +453,12 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         } catch (e) {}
       }
 
-      const isHindi = selectedVoice?.toLowerCase().includes('hi') || selectedVoice?.toLowerCase().includes('swara') || selectedVoice?.toLowerCase().includes('aarav');
+      const isHindi =
+        selectedLanguageRef.current.startsWith('hi') ||
+        selectedVoice?.toLowerCase().includes('hi') ||
+        selectedVoice?.toLowerCase().includes('swara') ||
+        selectedVoice?.toLowerCase().includes('aarav') ||
+        selectedVoice?.toLowerCase().includes('madhur');
       const recognition = new SpeechRec();
       recognition.continuous = true;
       recognition.interimResults = true;
@@ -450,7 +471,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
 
       recognition.onresult = (event: any) => {
-        if (isCommittingTurnRef.current) return;
+        if (isCommittingTurnRef.current || isAgentSpeakingRef.current || isAudioPlaying()) return;
 
         let interim = '';
         let final = '';
@@ -467,14 +488,6 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         const candidateText = (final || interim).trim();
 
         if (candidateText) {
-          // If agent is speaking, the caller is interrupting Alex (barge-in!)
-          if (isAgentSpeakingRef.current) {
-            console.log('🚨 Barge-in: caller voice recognized while agent speaking');
-            stopSpeechAudio();
-            isAgentSpeakingRef.current = false;
-            setBargeInNotice(true);
-            setTimeout(() => setBargeInNotice(false), 2000);
-          }
 
           currentRecognizedTextRef.current = candidateText;
           setInterimTranscript(candidateText);
@@ -490,8 +503,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
           }
 
           // When speech recognition yields words, commit after user finishes speaking:
-          // 200ms on final transcript, 520ms on natural pause in interim transcript
-          const delayMs = final ? 200 : 520;
+          // 450ms on final transcript, 900ms on natural pause in interim transcript
+          const delayMs = final ? 450 : 900;
 
           speechSilenceTimeoutRef.current = setTimeout(() => {
             const textToSend = currentRecognizedTextRef.current.trim();
@@ -508,6 +521,9 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
                 clearTimeout(vadSilenceTimeoutRef.current);
                 vadSilenceTimeoutRef.current = null;
               }
+              isManualRecordingRef.current = false;
+              isVadRecordingRef.current = false;
+              setIsRecordingAudio(false);
               if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                 try { mediaRecorderRef.current.stop(); } catch (e) {}
               }
@@ -574,11 +590,18 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     }
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      if (isManualPtt) {
+        isManualRecordingRef.current = true;
+        setMicStatusMsg('🔴 Recording your speech... Speak now!');
+        setMicStatusColor('text-rose-400');
+      }
       return;
     }
 
     try {
       audioChunksRef.current = [];
+      hasSpokenInRecordingRef.current = false;
+      speechFramesInRecordingRef.current = 0;
       const mimeType = getSupportedMimeType();
       const options = mimeType ? { mimeType } : undefined;
       const recorder = new MediaRecorder(stream, options);
@@ -590,21 +613,51 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         }
       };
 
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const chunks = audioChunksRef.current;
         const durationMs = Date.now() - recordingStartTimeRef.current;
+        const wasManual = isManualRecordingRef.current || isManualPtt;
+        const speechFrames = speechFramesInRecordingRef.current;
         isVadRecordingRef.current = false;
+        isManualRecordingRef.current = false;
         setIsRecordingAudio(false);
 
-        // If SpeechRecognition is already capturing or handling the text, skip duplicate audio blob upload!
-        if (currentRecognizedTextRef.current.trim().length > 0 || isCommittingTurnRef.current) {
+        // If a turn is already being committed, skip duplicate audio upload
+        if (isCommittingTurnRef.current) {
           return;
         }
 
-        // Discard very short accidental clicks (< 400ms) unless manual PTT
-        if (chunks.length > 0 && (durationMs > 450 || isManualPtt)) {
-          const recordedBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-          sendAudioTurn(recordedBlob);
+        // If browser SpeechRecognition already captured text during this utterance, commit it immediately!
+        const recognizedText = currentRecognizedTextRef.current.trim();
+        if (recognizedText.length > 0) {
+          if (speechSilenceTimeoutRef.current) {
+            clearTimeout(speechSilenceTimeoutRef.current);
+            speechSilenceTimeoutRef.current = null;
+          }
+          currentRecognizedTextRef.current = '';
+          setInterimTranscript('');
+          if (isStandaloneModeRef.current) {
+            handleStandaloneUserTurn(recognizedText);
+          } else {
+            commitUserTurn(recognizedText);
+          }
+          return;
+        }
+
+        // Discard very short or silent automatic VAD clips
+        if (chunks.length > 0 && (wasManual || (durationMs >= 650 && speechFrames >= 4))) {
+          const rawBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+          const { wavBlob, rms } = await blobToWav16k(rawBlob);
+
+          // Filter out silent background hum on automatic VAD
+          if (!wasManual && rms < 0.008) {
+            setAgentWaveState('off');
+            setMicStatusMsg('Microphone: Listening for your voice... 🟢');
+            setMicStatusColor('text-emerald-400');
+            return;
+          }
+
+          sendAudioTurn(wavBlob, wasManual);
         } else {
           setAgentWaveState('off');
           setMicStatusMsg('Microphone: Listening for your voice... 🟢');
@@ -613,16 +666,23 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
 
       recordingStartTimeRef.current = Date.now();
-      isVadRecordingRef.current = true;
+      isVadRecordingRef.current = !isManualPtt;
+      isManualRecordingRef.current = isManualPtt;
       setIsRecordingAudio(true);
       setAgentWaveState('caller-speaking');
       setMicStatusMsg(isManualPtt ? '🔴 Recording your speech... Speak now!' : '🎙️ Listening to you speak...');
       setMicStatusColor('text-rose-400');
 
+      // Also ensure browser speech recognition is running in parallel for instant live interim captions
+      if (!speechRecognitionRef.current) {
+        startBrowserSpeechRecognition();
+      }
+
       recorder.start(100); // 100ms chunk intervals
     } catch (err) {
       console.warn('MediaRecorder start error:', err);
       isVadRecordingRef.current = false;
+      isManualRecordingRef.current = false;
       setIsRecordingAudio(false);
     }
   };
@@ -642,7 +702,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
   };
 
   // Send recorded audio Blob to backend Gemini ASR and TTS pipeline
-  const sendAudioTurn = async (audioBlob: Blob) => {
+  const sendAudioTurn = async (audioBlob: Blob, isManual = false) => {
     if (isAgentSpeakingRef.current || isCommittingTurnRef.current) return;
     isCommittingTurnRef.current = true;
     setIsSending(true);
@@ -666,13 +726,15 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     const safetyTimeout = setTimeout(() => {
       isCommittingTurnRef.current = false;
       setIsSending(false);
-    }, 12000);
+    }, 10000);
 
     try {
+      const ext = audioBlob.type.includes('wav') ? 'wav' : 'webm';
       const formData = new FormData();
-      formData.append('audio', audioBlob, 'recording.webm');
+      formData.append('audio', audioBlob, `recording.${ext}`);
       formData.append('call_id', currentCallIdRef.current);
-      formData.append('voice', selectedVoice);
+      formData.append('voice', selectedVoiceRef.current);
+      formData.append('language', selectedLanguageRef.current);
 
       const response = await fetch('/api/dialer/call/interact', {
         method: 'POST',
@@ -684,13 +746,25 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       }
 
       const data = await response.json();
+      if (data.language && (data.language === 'hi' || data.language === 'hi-Latn' || data.language === 'en')) {
+        setSelectedLanguage(data.language);
+        selectedLanguageRef.current = data.language;
+        if (data.language.startsWith('hi') && selectedVoiceRef.current.startsWith('en-')) {
+          setSelectedVoice('hi-IN-SwaraNeural');
+          selectedVoiceRef.current = 'hi-IN-SwaraNeural';
+        }
+      }
 
-      // If no response was generated at all, quietly continue listening
-      if (!data.response || !data.response.trim()) {
+      // If no speech was detected in the recording, reset cleanly and notify if manual
+      if (data.no_speech || !data.response || !data.response.trim()) {
         setAgentWaveState('off');
         setSubtext('Active Live Call • Alex is listening...');
-        setMicStatusMsg('Microphone: Listening for your voice... 🟢');
-        setMicStatusColor('text-emerald-400');
+        setMicStatusMsg(
+          isManual
+            ? 'Microphone: No speech detected — please speak clearly and try again 🎤'
+            : 'Microphone: Listening for your voice... 🟢'
+        );
+        setMicStatusColor(isManual ? 'text-amber-400' : 'text-emerald-400');
         return;
       }
 
@@ -729,7 +803,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         return next;
       });
 
-      // Speak response aloud
+      // Speak response aloud (pause speech recognition while Alex speaks to prevent speaker echo cutoff)
+      if (speechRecognitionRef.current) {
+        try { speechRecognitionRef.current.abort(); } catch (e) {}
+      }
       isAgentSpeakingRef.current = true;
       setAgentWaveState('agent-speaking');
       setSubtext(`Alex: "${data.response}"`);
@@ -821,7 +898,8 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         body: JSON.stringify({
           text: clean,
           call_id: currentCallIdRef.current,
-          voice: selectedVoice
+          voice: selectedVoiceRef.current,
+          language: selectedLanguageRef.current
         })
       });
 
@@ -831,6 +909,14 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
       const data = await response.json();
       setIsStandaloneMode(false);
+      if (data.language && (data.language === 'hi' || data.language === 'hi-Latn' || data.language === 'en')) {
+        setSelectedLanguage(data.language);
+        selectedLanguageRef.current = data.language;
+        if (data.language.startsWith('hi') && selectedVoiceRef.current.startsWith('en-')) {
+          setSelectedVoice('hi-IN-SwaraNeural');
+          selectedVoiceRef.current = 'hi-IN-SwaraNeural';
+        }
+      }
 
       const botMsg: MessageItem = {
         id: `bot-${Date.now()}`,
@@ -854,12 +940,15 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         return next;
       });
 
-      // Play audio response
+      // Play audio response (pause speech recognition while Alex speaks)
+      if (speechRecognitionRef.current) {
+        try { speechRecognitionRef.current.abort(); } catch (e) {}
+      }
       isAgentSpeakingRef.current = true;
       setAgentWaveState('agent-speaking');
       setSubtext(`Alex: "${data.response}"`);
 
-      await playVoiceAudio(data.response, data.audio_url, selectedVoice, isSpeakerOnRef.current);
+      await playVoiceAudio(data.response, data.audio_url, selectedVoiceRef.current, isSpeakerOnRef.current);
 
       agentFinishedSpeakingTimeRef.current = Date.now();
       isAgentSpeakingRef.current = false;
@@ -958,7 +1047,14 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
         body: JSON.stringify({
           call_id: newCallId,
           direction: 'inbound',
-          voice: selectedVoice
+          voice: selectedVoiceRef.current,
+          language: selectedLanguageRef.current,
+          campaign:
+            selectedLanguageRef.current === 'hi'
+              ? 'support_hi'
+              : selectedLanguageRef.current === 'hi-Latn'
+              ? 'support_hinglish'
+              : 'support'
         })
       })
         .then(async (res) => {
@@ -1024,10 +1120,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
       };
       setMessages((prev) => [...prev, greetingMsg]);
 
-      // 5. Start browser speech recognition IMMEDIATELY for seamless hands-free telephone dialogue
-      startBrowserSpeechRecognition();
-
-      // 6. Play greeting aloud automatically (Chrome-unlocked)
+      // 5. Play greeting aloud automatically, then start speech recognition once greeting finishes
+      if (speechRecognitionRef.current) {
+        try { speechRecognitionRef.current.abort(); } catch (e) {}
+      }
       isAgentSpeakingRef.current = true;
       setAgentWaveState('agent-speaking');
       setSubtext(`Alex: "${greetingText}"`);
@@ -1042,6 +1138,9 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
           setSubtext('Active Live Call • Alex is listening...');
           setMicStatusMsg('Microphone: Listening for your voice... 🟢');
           setMicStatusColor('text-emerald-400');
+          if (isInCallRef.current) {
+            startBrowserSpeechRecognition();
+          }
         }
       });
     } catch (err: any) {
@@ -1216,23 +1315,62 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
     setInputText('');
   };
 
+  // Handle language switch (English / Hindi / Hinglish)
+  const handleLanguageChange = (lang: 'en' | 'hi' | 'hi-Latn') => {
+    unlockAudioPlayback();
+    setSelectedLanguage(lang);
+    selectedLanguageRef.current = lang;
+    if (lang.startsWith('hi')) {
+      if (selectedVoiceRef.current.startsWith('en-')) {
+        setSelectedVoice('hi-IN-SwaraNeural');
+        selectedVoiceRef.current = 'hi-IN-SwaraNeural';
+      }
+    } else {
+      if (selectedVoiceRef.current.startsWith('hi-')) {
+        setSelectedVoice('en-US-JennyNeural');
+        selectedVoiceRef.current = 'en-US-JennyNeural';
+      }
+    }
+    if (isInCallRef.current && !isAgentSpeakingRef.current) {
+      setTimeout(() => startBrowserSpeechRecognition(), 100);
+    }
+  };
+
   // Handle text input submission
   const handleTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const clean = inputText.trim();
     if (!clean || isSending) return;
+    unlockAudioPlayback();
     setInputText('');
     commitUserTurn(clean);
   };
 
-  // Quick Prompt Chips
-  const quickPrompts = [
-    { label: '🌏 Capital of Australia', query: 'What is the capital of Australia, and what is interesting about it?' },
-    { label: '✈️ How airplanes fly', query: 'Can you explain how airplanes stay up in the sky in simple terms?' },
-    { label: '🧮 Tip calculation', query: 'What is a fifteen percent tip on eighty-four dollars?' },
-    { label: '💰 Connect to Billing', query: 'Can you connect me to billing and payments department?' },
-    { label: '🕒 Business Hours', query: 'What are your business hours this week?' }
-  ];
+  // Quick Prompt Chips (English & Hindi)
+  const quickPrompts =
+    selectedLanguage === 'hi'
+      ? [
+          { label: '🇮🇳 नमस्ते, खाते की जानकारी', query: 'नमस्ते, मुझे अपने खाते की जानकारी चाहिए' },
+          { label: '📦 रिफंड पॉलिसी क्या है?', query: 'आपकी रिफंड नीति क्या है और पैसे कब मिलेंगे?' },
+          { label: '💰 बिलिंग विभाग (Ext 102)', query: 'कृपया मुझे बिलिंग विभाग एक्सटेंशन 102 से जोड़ें' },
+          { label: '💳 मासिक प्लान का शुल्क', query: 'आपके मासिक प्लान का शुल्क कितना है?' },
+          { label: '🕒 सहायता सेवा का समय', query: 'आपकी ग्राहक सहायता सेवा का समय क्या है?' }
+        ]
+      : selectedLanguage === 'hi-Latn'
+      ? [
+          { label: '🇮🇳 Account details chahiye', query: 'Hello, mujhe apne account ki details chahiye.' },
+          { label: '📦 Refund Policy kya hai?', query: 'Aapki return aur refund policy kya hai?' },
+          { label: '💰 Billing Transfer (Ext 102)', query: 'Mujhe billing aur payments department se connect kar do.' },
+          { label: '💳 New Plan Pricing (₹)', query: 'Mujhe new plan purchase karna hai, pricing kya hai?' },
+          { label: '🕒 Support Timings (IST)', query: 'Customer care ke working hours kya hain?' }
+        ]
+      : [
+          { label: '🇮🇳 हिंदी में बात करें (Hindi)', query: 'नमस्ते, मुझे अपने खाते की जानकारी चाहिए' },
+          { label: '📦 Refund Policy', query: 'What is your refund policy for a recent order?' },
+          { label: '💳 Monthly Plan Pricing', query: 'What are the monthly subscription plan prices in INR?' },
+          { label: '🕒 Support Hours (IST)', query: 'What are your customer support hours today?' },
+          { label: '💰 Connect to Billing (Ext 102)', query: 'Please transfer my call to the billing department on extension 102.' }
+        ];
 
   return (
     <div className="space-y-6">
@@ -1257,13 +1395,52 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
               </span>
               <span>
                 {callStatus === 'in-call'
-                  ? 'In Call with Alex'
+                  ? selectedLanguage === 'hi'
+                    ? 'कॉल चालू है (In Call)'
+                    : 'In Call with Alex'
                   : callStatus === 'ringing'
                   ? 'Calling Alex...'
                   : callStatus === 'ended'
                   ? 'Call Ended'
                   : 'Ready to Call'}
               </span>
+            </div>
+
+            {/* Language Selector Pills */}
+            <div className="inline-flex items-center bg-slate-950/70 border border-white/15 rounded-full p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => handleLanguageChange('en')}
+                className={`px-2.5 py-1 rounded-full font-bold transition-all cursor-pointer ${
+                  selectedLanguage === 'en'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                🇺🇸 English
+              </button>
+              <button
+                type="button"
+                onClick={() => handleLanguageChange('hi')}
+                className={`px-2.5 py-1 rounded-full font-bold transition-all cursor-pointer ${
+                  selectedLanguage === 'hi'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                🇮🇳 हिंदी (Hindi)
+              </button>
+              <button
+                type="button"
+                onClick={() => handleLanguageChange('hi-Latn')}
+                className={`px-2.5 py-1 rounded-full font-bold transition-all cursor-pointer ${
+                  selectedLanguage === 'hi-Latn'
+                    ? 'bg-indigo-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                🇮🇳 Hinglish
+              </button>
             </div>
 
             {isStandaloneMode && (
@@ -1498,21 +1675,34 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
 
         {/* Voice Selector Bar */}
         <div className="flex justify-between items-center mt-4 pt-4 border-t border-white/10 text-xs sm:text-sm text-slate-400 flex-wrap gap-2">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span>Agent Voice:</span>
             <select
               value={selectedVoice}
-              onChange={(e) => setSelectedVoice(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setSelectedVoice(v);
+                selectedVoiceRef.current = v;
+                if (v.startsWith('hi-') && selectedLanguageRef.current === 'en') {
+                  setSelectedLanguage('hi');
+                  selectedLanguageRef.current = 'hi';
+                } else if (v.startsWith('en-') && selectedLanguageRef.current.startsWith('hi')) {
+                  setSelectedLanguage('en');
+                  selectedLanguageRef.current = 'en';
+                }
+              }}
               className="bg-slate-900/80 text-slate-200 border border-white/20 rounded-lg px-2.5 py-1 text-xs outline-none cursor-pointer"
             >
-              <option value="en-US-JennyNeural">Jenny (Warm & Natural)</option>
-              <option value="en-US-GuyNeural">Guy (Professional Male)</option>
-              <option value="en-US-AriaNeural">Aria (Expressive)</option>
+              <option value="en-US-JennyNeural">🇺🇸 Jenny (English Warm Female)</option>
+              <option value="en-US-GuyNeural">🇺🇸 Guy (English Professional Male)</option>
+              <option value="en-US-AriaNeural">🇺🇸 Aria (English Expressive Female)</option>
+              <option value="hi-IN-SwaraNeural">🇮🇳 Swara (हिंदी Female - Warm & Natural)</option>
+              <option value="hi-IN-MadhurNeural">🇮🇳 Madhur (हिंदी Male - Professional)</option>
             </select>
           </div>
           {isHandsfree && (
             <div className="flex items-center gap-1.5 text-emerald-400 font-semibold text-xs">
-              <span>●</span> Hands-Free Mode Active (Continuous Speech)
+              <span>●</span> Hands-Free Mode Active ({selectedLanguage === 'hi' ? 'हिंदी' : selectedLanguage === 'hi-Latn' ? 'Hinglish' : 'English'})
             </div>
           )}
         </div>
@@ -1634,7 +1824,13 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
             type="text"
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            placeholder="Type a question or message to Alex..."
+            placeholder={
+              selectedLanguage === 'hi'
+                ? 'हिंदी या अंग्रेज़ी में अपना सवाल लिखें या बोलें...'
+                : selectedLanguage === 'hi-Latn'
+                ? 'Hinglish ya Hindi mein apna sawal likhein...'
+                : 'Type a question in English or हिंदी (Hindi)...'
+            }
             className="flex-1 bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm text-slate-800 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
           />
           {/* Quick Voice Speak Button next to Chat */}
@@ -1685,7 +1881,10 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
             <button
               key={i}
               type="button"
-              onClick={() => commitUserTurn(p.query)}
+              onClick={() => {
+                unlockAudioPlayback();
+                commitUserTurn(p.query);
+              }}
               className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-300 text-slate-700 hover:text-blue-700 px-3 py-1.5 rounded-lg font-medium transition-all cursor-pointer shadow-2xs"
             >
               {p.label}
@@ -1722,26 +1921,26 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = () => {
                   <span className="text-[11px] font-bold text-emerald-600 mb-1">🤖 Alex (AI Agent)</span>
                   <div className="bg-slate-50 border border-slate-200 text-slate-800 px-4 py-2.5 rounded-2xl rounded-bl-xs text-sm max-w-[85%] leading-relaxed shadow-2xs">
                     <p>{m.text}</p>
-                    {m.audioUrl && (
-                      <div className="mt-2.5 pt-2 border-t border-slate-200 flex flex-col gap-1.5">
+                    <div className="mt-2.5 pt-2 border-t border-slate-200 flex flex-col gap-1.5">
+                      {m.audioUrl && !m.audioUrl.includes('fallback-') && (
                         <audio
                           controls
                           src={m.audioUrl}
                           className="w-full h-8 outline-none"
-                          preload="metadata"
+                          preload="auto"
                         />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            unlockAudioContext();
-                            playVoiceAudio(m.text, m.audioUrl, selectedVoice, true);
-                          }}
-                          className="text-[11px] text-blue-600 hover:text-blue-800 font-semibold self-start flex items-center gap-1 cursor-pointer"
-                        >
-                          <span>🔊</span> Replay Voice
-                        </button>
-                      </div>
-                    )}
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          unlockAudioPlayback();
+                          playVoiceAudio(m.text, m.audioUrl, selectedVoice, true);
+                        }}
+                        className="text-[11px] text-blue-600 hover:text-blue-800 font-semibold self-start flex items-center gap-1 cursor-pointer"
+                      >
+                        <span>🔊</span> Replay Voice
+                      </button>
+                    </div>
                   </div>
                 </div>
               );

@@ -1,8 +1,8 @@
 import React from 'react';
 
 interface HeaderProps {
-  activeTab: 'voice' | 'dialer' | 'qa' | 'api';
-  onTabChange: (tab: 'voice' | 'dialer' | 'qa' | 'api') => void;
+  activeTab: 'voice' | 'dialer' | 'qa' | 'sovereign' | 'api';
+  onTabChange: (tab: 'voice' | 'dialer' | 'qa' | 'sovereign' | 'api') => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({ activeTab, onTabChange }) => {
@@ -14,19 +14,19 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onTabChange }) => {
         </h1>
         <div className="flex items-center gap-2">
           <span className="bg-sky-500/25 border border-sky-400 text-sky-100 text-xs font-bold px-3 py-1 rounded-full uppercase tracking-wider">
-            Phase 2 • Multi-Lang & QA
+            Sovereign GPU &amp; QA
           </span>
           <span className="bg-emerald-500/25 border border-emerald-400 text-emerald-100 text-xs font-bold px-3 py-1 rounded-full uppercase tracking-wider hidden sm:inline">
-            Telephony PBX Ready
+            AudioSocket PBX Ready
           </span>
         </div>
       </div>
       <p className="text-slate-200 text-sm sm:text-[0.95rem] mt-1.5">
-        Production Voice Engine • English, Hindi & Hinglish • Automatic Fallbacks, ASR Retries & QA Retraining
+        Sovereign GPU Voice Engine • Hindi, English &amp; Indic • vLLM 7B AWQ, 8kHz Whisper, Indic Parler-TTS &amp; VICIdial AudioSocket
       </p>
 
       {/* Tabs */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 bg-slate-900/35 rounded-xl p-1 mt-5 gap-1.5">
+      <div className="grid grid-cols-2 sm:grid-cols-5 bg-slate-900/35 rounded-xl p-1 mt-5 gap-1.5">
         <button
           type="button"
           onClick={() => onTabChange('voice')}
@@ -50,7 +50,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onTabChange }) => {
           }`}
         >
           <span>📞</span>
-          <span>Dialer & PBX</span>
+          <span>Dialer &amp; PBX</span>
         </button>
 
         <button
@@ -63,7 +63,20 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onTabChange }) => {
           }`}
         >
           <span>🛡️</span>
-          <span>QA & Analyst</span>
+          <span>QA &amp; Analyst</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onTabChange('sovereign')}
+          className={`py-2 px-2.5 sm:px-3 rounded-lg text-xs sm:text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer ${
+            activeTab === 'sovereign'
+              ? 'bg-white text-slate-900 shadow-md'
+              : 'text-slate-200 hover:text-white hover:bg-white/10'
+          }`}
+        >
+          <span>🏛️</span>
+          <span>Sovereign Plan</span>
         </button>
 
         <button
@@ -76,9 +89,10 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onTabChange }) => {
           }`}
         >
           <span>🔌</span>
-          <span>API & Security</span>
+          <span>API &amp; Security</span>
         </button>
       </div>
     </div>
   );
 };
+

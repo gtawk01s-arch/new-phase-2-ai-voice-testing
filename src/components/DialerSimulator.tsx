@@ -13,15 +13,15 @@ export const DialerSimulator: React.FC<DialerSimulatorProps> = ({
   onTransferToExt
 }) => {
   // Inbound Form
-  const [inboundCallerId, setInboundCallerId] = useState('+1 (555) 345-6789');
+  const [inboundCallerId, setInboundCallerId] = useState('+91 98765 43210');
   const [inboundGreeting, setInboundGreeting] = useState(
-    'Thank you for calling Customer Support. I am your automated AI assistant. How can I help you today?'
+    'नमस्ते, ग्राहक सहायता में आपका स्वागत है। मैं आपका एआई सहायक अलेक्स हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?'
   );
 
   // Outbound Form
-  const [outboundName, setOutboundName] = useState('Sarah Jenkins');
-  const [outboundPhone, setOutboundPhone] = useState('+1 (555) 789-0123');
-  const [outboundCampaign, setOutboundCampaign] = useState('Account Follow-up');
+  const [outboundName, setOutboundName] = useState('Aarav Sharma');
+  const [outboundPhone, setOutboundPhone] = useState('+91 98201 11223');
+  const [outboundCampaign, setOutboundCampaign] = useState('support_hi');
 
   // Extensions & Call Sessions
   const [extensions, setExtensions] = useState<Extension[]>([]);
